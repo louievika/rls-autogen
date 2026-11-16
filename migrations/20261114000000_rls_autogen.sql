@@ -28,6 +28,15 @@
 --
 -- Opt out for the tables created in one transaction
 --   set local maintenance.rls_autogen = 'off';
+--   Only set local inside a transaction is supported. Set at any other level (a
+--   plain set, alter role ... set, alter database ... set, connection options),
+--   the switch keeps the trigger off for every later table on that connection,
+--   role or database. A set left on a pooled connection carries over to the next
+--   client that gets it. Each skipped table raises a WARNING that names it and
+--   says RLS was NOT enabled; when the value is also set beyond this session's
+--   own set commands, the WARNING says so and how to clear it. To check the
+--   current value:
+--     select pg_catalog.current_setting('maintenance.rls_autogen', true);
 --
 -- Known limits
 --   - A foreign key added later with ALTER TABLE does not fire the trigger. Run
@@ -182,14 +191,37 @@ as $$
 declare
   -- Watched schemas. Add names here to cover more schemas.
   c_schemas constant text[] := array['public'];
-  v_setting text := pg_catalog.lower(pg_catalog.btrim(
-                      coalesce(pg_catalog.current_setting('maintenance.rls_autogen', true), '')));
+  v_value  text := coalesce(pg_catalog.current_setting('maintenance.rls_autogen', true), '');
+  v_off    boolean := pg_catalog.lower(pg_catalog.btrim(v_value)) in ('off', 'false', '0');
+  v_reset  text;
+  v_skip   text;
   v_oid    oid;
   v_in_ext boolean;
   v_ext    name;
 begin
-  if v_setting in ('off', 'false', '0') then
-    return;
+  if v_off then
+    -- Read the value RESET would return, which comes from the role, the database,
+    -- the connection options or the server configuration. The subtransaction is
+    -- rolled back, so the current value is left exactly as it was. A plain SET and
+    -- SET LOCAL cannot be told apart from SQL, so both get the first message.
+    begin
+      execute 'reset maintenance.rls_autogen';
+      v_reset := coalesce(pg_catalog.current_setting('maintenance.rls_autogen', true), '');
+      raise exception 'rls_autogen: probe';
+    exception when raise_exception then
+      null;
+    end;
+    if pg_catalog.lower(pg_catalog.btrim(v_reset)) in ('off', 'false', '0') then
+      v_skip := pg_catalog.format(
+        'It is set beyond this transaction (for the role, the database, the connection options or the server configuration), '
+        'so every later table on this connection is skipped too. reset maintenance.rls_autogen does not clear it; '
+        'run alter role %I reset maintenance.rls_autogen or alter database %I reset maintenance.rls_autogen '
+        '(or remove it from the connection options or server configuration), then reconnect.',
+        session_user, pg_catalog.current_database());
+    else
+      v_skip := 'Only set local inside a transaction is supported; a plain set keeps it off for every later table '
+                'on this connection until reset maintenance.rls_autogen.';
+    end if;
   end if;
 
   for v_oid, v_in_ext in
@@ -204,6 +236,12 @@ begin
      group by c.oid
      order by c.oid
   loop
+    if v_off then
+      -- WARNING, not NOTICE, so it shows at default client settings.
+      raise warning 'rls_autogen: RLS was NOT enabled on % because maintenance.rls_autogen is off (%). %',
+        v_oid::pg_catalog.regclass, pg_catalog.quote_literal(v_value), v_skip;
+      continue;
+    end if;
     begin
       if v_in_ext then
         -- Created by an extension script: lock it, but never guess an owner column.

@@ -80,6 +80,24 @@ commit;
 
 `off`, `false` and `0` (any case) switch it off. Any other value, or no value, means on.
 
+Only `set local` inside a transaction is the supported form. Set at any other level, a plain `set`, `alter role ... set`, `alter database ... set` or the connection options (`PGOPTIONS`), the switch keeps the trigger off for every later table on that connection, role or database, until it is cleared. A `set` left on a pooled connection carries over to the next client that gets that connection.
+
+Each table the trigger skips because the switch is off raises a `WARNING` that names the table and says RLS was NOT enabled because `maintenance.rls_autogen` is off. When the value also comes from the role, the database, the connection options or the server configuration, the warning says it is set beyond this transaction and gives the `alter role ... reset` and `alter database ... reset` commands; `reset maintenance.rls_autogen` does not clear such a value. A plain `set` and `set local` cannot be told apart from SQL, so for those the warning says that only `set local` is supported and that `reset maintenance.rls_autogen` clears a plain `set`.
+
+To check the current value (empty or null means on):
+
+```sql
+select pg_catalog.current_setting('maintenance.rls_autogen', true);
+```
+
+To find a value stored for a role or a database:
+
+```sql
+select setrole::regrole as role, setdatabase, setconfig
+  from pg_catalog.pg_db_role_setting
+ where pg_catalog.array_to_string(setconfig, ',') like '%maintenance.rls_autogen=%';
+```
+
 Existing tables, or a table that got its owner foreign key later through `alter table`, need one manual call:
 
 ```sql
@@ -100,9 +118,9 @@ psql "$DATABASE_URL" -f test/verify.sql
 
 Or paste it into the SQL editor and choose "Run without RLS" when asked. A good run shows Success; the PASS notices appear only in psql. It takes a few seconds.
 
-It runs in one transaction that ends in `rollback`, so it leaves nothing behind. It creates tables and domains named `public.demo_*` and stops with an error if one already exists. It also creates two `auth.users` rows with random ids, then acts as `anon` and as two signed-in users the way the Data API does (`set local role` plus `request.jwt.claims`). It checks: RLS on, the four policies, anon denied, owner allowed on their own rows only, another user denied, no-owner tables deny-all, the opt-out, owner column choice, the name fallback (`user_id` or `owner_id` without a foreign key, non-uuid columns ignored, foreign key wins, a `user_id` with a foreign key to another table gets no policies), domains over `uuid`, quoted and unusual table names, re-runs, existing policies kept, `CREATE TABLE AS`, `SELECT INTO`, partitions, that other schemas and temporary tables are left alone, and that tables created by an extension get RLS and no policies (check h10). For h10 it creates the first of `pg_partman` and `postgis` that is available and not installed yet in `public`, inside the same transaction, and checks every table that extension put there. A table counts as a test of the trigger only when it is owned by the current role and that role is not a superuser, which shows the script ran as that role; a table owned by another role, such as a superuser, is recorded as not a test of the trigger. It tries `postgis` only if `pg_partman` tested no table. Any error from that `create extension` is a FAIL. Check h11 pins a documented limit: a table moved into `public` with `set schema` and a partition attached with `attach partition` keep RLS off until the manual call.
+It runs in one transaction that ends in `rollback`, so it leaves nothing behind. It creates tables and domains named `public.demo_*` and stops with an error if one already exists. It also creates two `auth.users` rows with random ids, then acts as `anon` and as two signed-in users the way the Data API does (`set local role` plus `request.jwt.claims`). It checks: RLS on, the four policies, anon denied, owner allowed on their own rows only, another user denied, no-owner tables deny-all, the opt-out (with `set local`, and check g2: a plain `set` also skips every later table until `reset`), owner column choice, the name fallback (`user_id` or `owner_id` without a foreign key, non-uuid columns ignored, foreign key wins, a `user_id` with a foreign key to another table gets no policies), domains over `uuid`, quoted and unusual table names, re-runs, existing policies kept, `CREATE TABLE AS`, `SELECT INTO`, partitions, that other schemas and temporary tables are left alone, and that tables created by an extension get RLS and no policies (check h10). For h10 it creates the first of `pg_partman` and `postgis` that is available and not installed yet in `public`, inside the same transaction, and checks every table that extension put there. A table counts as a test of the trigger only when it is owned by the current role and that role is not a superuser, which shows the script ran as that role; a table owned by another role, such as a superuser, is recorded as not a test of the trigger. It tries `postgis` only if `pg_partman` tested no table. Any error from that `create extension` is a FAIL. Check h11 pins a documented limit: a table moved into `public` with `set schema` and a partition attached with `attach partition` keep RLS off until the manual call.
 
-A good run prints one `NOTICE:  PASS ...` line per check and ends with:
+The tables the opt-out checks create on purpose (checks g, g2, h6 and h11) each print a `WARNING:  rls_autogen: RLS was NOT enabled on ...` line; that is expected, and SQL cannot assert a warning, so read it in the output. A good run prints one `NOTICE:  PASS ...` line per check and ends with:
 
 ```
 NOTICE:  ALL CHECKS PASSED
@@ -131,6 +149,7 @@ Screenshots of a verification run are in [`proofs/`](proofs/).
 - The functions run as the caller (`security invoker`), with an empty `search_path` and quoted identifiers. `public`, `anon` and `authenticated` have no access to the `maintenance` schema or its functions; only their owner and `postgres` do. A role that is not `postgres` and creates a table in `public` gets an error and must be granted `usage` on `maintenance` and `execute` on `maintenance.apply_owner_policies(regclass)`, or opt out for that transaction.
 - The name fallback trusts the column name. A `uuid` column called `user_id` or `owner_id` without any foreign key is treated as the owner, whatever it really holds. If such a column means something else in your table, add a foreign key to the real owner column, or opt out and write your own policies.
 - Policies only cover the owner case. Anything shared or public needs its own policies.
+- The opt-out switch `maintenance.rls_autogen` is supported only as `set local` inside a transaction. A plain `set`, `alter role ... set`, `alter database ... set` or a connection option keeps the trigger off for every later table on that connection, role or database, and a `set` left on a pooled connection carries over to the next client. Each skipped table raises a `WARNING`; check the current value with `select pg_catalog.current_setting('maintenance.rls_autogen', true);`.
 
 ## License
 

@@ -15,6 +15,8 @@
 -- The last line of a good run is NOTICE 'ALL CHECKS PASSED'. If a check was
 -- skipped it reads NOTICE 'ALL CHECKS PASSED (1 skipped: h10)', which is not a
 -- full pass: the skipped check was not tested.
+-- Checks g, g2, h6 and h11 switch the trigger off on purpose, so each table they skip
+-- prints WARNING 'rls_autogen: RLS was NOT enabled on ...'. That is expected.
 
 begin;
 
@@ -298,6 +300,47 @@ begin
     raise exception 'FAIL g: trigger did not resume after setting it back on';
   end if;
   raise notice 'PASS g: off / FALSE / 0 skip the table (no RLS, no policies); back on -> RLS and 4 policies';
+end;
+$$;
+
+-- g2. A plain set (not set local) also skips: it keeps the trigger off for every
+-- later table on the connection. Each skipped table (here and in g) raises a
+-- WARNING; SQL cannot assert a WARNING, so it shows in the output only. The
+-- trigger must leave the value as it was. Restored with reset before going on.
+set maintenance.rls_autogen = 'off';
+create table public.demo_optout_session (id uuid primary key, user_id uuid references auth.users (id));
+create table public.demo_optout_session_2 (id uuid primary key, user_id uuid references auth.users (id));
+
+do $$
+declare
+  v_t regclass;
+begin
+  if pg_catalog.current_setting('maintenance.rls_autogen', true) is distinct from 'off' then
+    raise exception 'FAIL g2: the trigger changed maintenance.rls_autogen (now %)',
+      pg_catalog.current_setting('maintenance.rls_autogen', true);
+  end if;
+  foreach v_t in array array['public.demo_optout_session', 'public.demo_optout_session_2']::regclass[] loop
+    if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) or pg_temp.policy_list(v_t) <> '' then
+      raise exception 'FAIL g2: % got RLS or policies although a plain set switched the trigger off', v_t;
+    end if;
+  end loop;
+end;
+$$;
+
+reset maintenance.rls_autogen;
+create table public.demo_optin_after_reset (id uuid primary key, user_id uuid references auth.users (id));
+
+do $$
+begin
+  if pg_catalog.lower(pg_catalog.btrim(coalesce(pg_catalog.current_setting('maintenance.rls_autogen', true), '')))
+       in ('off', 'false', '0') then
+    raise exception 'FAIL g2: maintenance.rls_autogen is still off after reset (set for the role, database or connection?)';
+  end if;
+  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_optin_after_reset'::regclass)
+     or pg_temp.policy_list('public.demo_optin_after_reset') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update' then
+    raise exception 'FAIL g2: trigger did not resume after reset maintenance.rls_autogen';
+  end if;
+  raise notice 'PASS g2: a plain set also skips every later table (no RLS, no policies) and the trigger leaves the value as it was; after reset -> RLS and 4 policies';
 end;
 $$;
 

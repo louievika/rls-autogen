@@ -74,6 +74,10 @@
 --     inside CREATE SCHEMA, tables moved in with SET SCHEMA, partitions added
 --     with ATTACH PARTITION, foreign keys added later, and tables that existed
 --     before this file. Use the manual call where RLS can be enabled.
+--   - Also not covered: a table created by EXPLAIN ANALYZE CREATE TABLE AS or
+--     EXPLAIN ANALYZE SELECT INTO, and extension tables moved into public with
+--     ALTER EXTENSION ... SET SCHEMA. The trigger does not fire for them, so
+--     they keep RLS off. Run the manual call on each, or enable RLS by hand.
 --   - The manual call on a partitioned table does not change its partitions.
 --   - A user_id or owner_id whose foreign key to another table is added later
 --     keeps the name fallback policies.

@@ -33,6 +33,7 @@ All notable changes to this project are listed here. The format follows Keep a C
 
 - README: requirements, the shared `maintenance` schema, a one-transaction install, read and write owner policies and how to make a table read-only, the grants a role other than `postgres` needs, the opt-out, and every form of the self-check's last line.
 - README: limits stated once: views, materialized views, foreign tables, `create schema`, `set schema`, `attach partition`, foreign keys added later, partitions and the manual call, dump and restore, and platforms that do not fire event triggers for some roles, with a query that lists tables in `public` with RLS off.
+- README and migration header: two more limits, a table created by `explain analyze create table ... as` or `explain analyze select ... into`, and extension tables moved into `public` with `alter extension ... set schema`, which keep RLS off until the manual call or RLS enabled by hand.
 - README: the roles that run the two grants for another table owner (owner of schema `maintenance`, owner of the functions), what the install revokes and from whom, and a query that lists every role with usage on schema `maintenance` or execute on its functions.
 - Migration header: a summary, the known limits and the accepted risks, including that a table's owner can still disable RLS on their own table.
 

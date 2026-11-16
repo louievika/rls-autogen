@@ -8,15 +8,15 @@
 -- when the trigger did not fire for the role running this file.
 --
 -- Everything runs in one transaction that ends in ROLLBACK, so nothing is left behind.
--- It creates tables and domains named public.demo_*, the schemas demo_other_schema
--- and demo_staging, the role demo_role (check j), a temporary table and two
--- temporary functions, two throwaway rows in auth.users with random ids, and the
--- first of the extensions pg_partman and postgis that is available and not
--- installed yet and can be created (check h10).
+-- It creates tables and domains named public.demo_*, two more tables in public
+-- with quoted names (public."Demo Table" and the injection test table
+-- public."demo_x""); drop table public.demo_posts; --"), the schemas
+-- demo_other_schema and demo_staging, the role demo_role (check j), a temporary
+-- table and two temporary functions, two throwaway rows in auth.users with random
+-- ids, and the first of the extensions pg_partman and postgis that is available
+-- and not installed yet and can be created (check h10).
 -- Any trigger you have on auth.users runs for those two rows (and is rolled back with them).
--- Run it with a search_path that does not include auth (for example
--- PGOPTIONS='-c search_path=public'): check b reads the policies back as text,
--- and with auth on the path they print uid() instead of auth.uid().
+-- It sets its own search_path for the transaction, so the caller's path does not matter.
 --
 -- Output, one line per check:
 --   PASS <check>: ...   (NOTICE)
@@ -30,12 +30,18 @@
 -- The last line of a good run is NOTICE 'ALL CHECKS PASSED'. If a check was
 -- skipped it reads NOTICE 'ALL CHECKS PASSED (1 skipped: h10)', which is not a
 -- full pass: the skipped check was not tested.
--- Checks g, g2, h6 and h11 switch the trigger off on purpose, so each table they skip
--- prints WARNING 'rls_autogen: RLS was NOT enabled on ...'. Check j prints
--- WARNING 'rls_autogen: ... has owner column ..., but ...' for demo_role's tables.
--- Both are expected.
+-- Checks g, h6, h11 and j2 opt out on purpose, so each table they skip prints
+-- WARNING 'rls_autogen: RLS is not enabled on ...'. Check g2 sets values that must
+-- be ignored, so each of its statements prints WARNING 'rls_autogen: ignored
+-- maintenance.rls_autogen = ...'. Check j prints WARNING 'rls_autogen: ... has
+-- owner column ..., but ...' for demo_role's tables. All are expected.
+-- The opt-out across transactions and in autocommit mode cannot be shown inside
+-- this file's single transaction; check g2 uses a token with another transaction
+-- id instead.
 
 begin;
+-- Predicate checks read policies back as text; pin the path so they print auth.uid().
+set local search_path = public;
 
 -- Act as a Supabase API role inside this transaction, the way PostgREST does it:
 -- set local role plus the JWT claims that auth.uid() reads.
@@ -282,9 +288,11 @@ insert into public.demo_notes (body) values ('seed');
 
 do $$
 declare
-  v_role text;
-  v_n    bigint;
+  v_role   text;
+  v_n      bigint;
+  v_before text;
 begin
+  select pg_catalog.md5(pg_catalog.string_agg(t::text, ',' order by t.id)) into v_before from public.demo_notes t;
   if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_notes'::regclass) then
     raise exception 'FAIL f: RLS is not enabled on public.demo_notes';
   end if;
@@ -300,49 +308,99 @@ begin
       raise exception 'FAIL f: % insert succeeded', v_role;
     exception when insufficient_privilege then null;
     end;
+    update public.demo_notes set body = 'x';
+    get diagnostics v_n = row_count;
+    if v_n <> 0 then raise exception 'FAIL f: % update changed % rows', v_role, v_n; end if;
+    delete from public.demo_notes;
+    get diagnostics v_n = row_count;
+    if v_n <> 0 then raise exception 'FAIL f: % delete removed % rows', v_role, v_n; end if;
     reset role;
   end loop;
-  raise notice 'PASS f: no owner column -> RLS on, 0 policies; anon and authenticated read 0 of 1 rows, insert denied';
+  if (select pg_catalog.md5(pg_catalog.string_agg(t::text, ',' order by t.id)) from public.demo_notes t)
+       is distinct from v_before then
+    raise exception 'FAIL f: demo_notes changed after anon and authenticated attempts';
+  end if;
+  raise notice 'PASS f: no owner column -> RLS on, 0 policies; anon and authenticated read 0 of 1 rows, insert denied, update and delete affect 0 rows; table unchanged';
 end;
 $$;
 
--- g. Opt-out with a transaction-local setting, then back on.
-set local maintenance.rls_autogen = 'off';
+-- g. Opt-out with maintenance.skip_rls_autogen(): every table created in public for
+-- the rest of the transaction is skipped, also inside a savepoint and after rolling
+-- back to a savepoint taken after the call. Called inside a savepoint that is rolled
+-- back, the call is undone; inside one that is released, it stays. Cleared with
+-- set local maintenance.rls_autogen = '' before going on.
+select maintenance.skip_rls_autogen();
 create table public.demo_optout (id uuid primary key, user_id uuid references auth.users (id));
-set local maintenance.rls_autogen = 'FALSE';
-create table public.demo_optout_false (id uuid primary key, user_id uuid references auth.users (id));
-set local maintenance.rls_autogen = '0';
-create table public.demo_optout_zero (id uuid primary key, user_id uuid references auth.users (id));
-set local maintenance.rls_autogen = 'on';
+savepoint demo_sp1;
+create table public.demo_optout_sp (id uuid primary key, user_id uuid references auth.users (id));
+
+do $$
+begin
+  if pg_catalog.current_setting('maintenance.rls_autogen', true)
+       is distinct from 'skip:' || pg_catalog.pg_current_xact_id()::text then
+    raise exception 'FAIL g: inside a savepoint the value is % and not the top-level token',
+      pg_catalog.current_setting('maintenance.rls_autogen', true);
+  end if;
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_optout_sp'::regclass)
+     or pg_temp.policy_list('public.demo_optout_sp') <> '' then
+    raise exception 'FAIL g: a table created inside a savepoint after the call got RLS or policies';
+  end if;
+end;
+$$;
+
+rollback to savepoint demo_sp1;
+create table public.demo_optout_after_sp (id uuid primary key, user_id uuid references auth.users (id));
+set local maintenance.rls_autogen = '';
+savepoint demo_sp2;
+select maintenance.skip_rls_autogen();
+rollback to savepoint demo_sp2;
+create table public.demo_optin_sp_undone (id uuid primary key, user_id uuid references auth.users (id));
+savepoint demo_sp3;
+select maintenance.skip_rls_autogen();
+release savepoint demo_sp3;
+create table public.demo_optout_released (id uuid primary key, user_id uuid references auth.users (id));
+set local maintenance.rls_autogen = '';
 create table public.demo_optin (id uuid primary key, user_id uuid references auth.users (id));
 
 do $$
 declare
   v_t regclass;
 begin
-  foreach v_t in array array['public.demo_optout', 'public.demo_optout_false', 'public.demo_optout_zero']::regclass[] loop
-    if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) then
-      raise exception 'FAIL g: % has RLS although the trigger was switched off', v_t;
-    end if;
-    if pg_temp.policy_list(v_t) <> '' then
-      raise exception 'FAIL g: % has policies although the trigger was switched off', v_t;
+  foreach v_t in array array['public.demo_optout', 'public.demo_optout_after_sp', 'public.demo_optout_released']::regclass[] loop
+    if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) or pg_temp.policy_list(v_t) <> '' then
+      raise exception 'FAIL g: % got RLS or policies although maintenance.skip_rls_autogen() was called', v_t;
     end if;
   end loop;
-  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_optin'::regclass)
-     or pg_temp.policy_list('public.demo_optin') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update' then
-    raise exception 'FAIL g: trigger did not resume after setting it back on';
-  end if;
-  raise notice 'PASS g: off / FALSE / 0 skip the table (no RLS, no policies); back on -> RLS and 4 policies';
+  foreach v_t in array array['public.demo_optin_sp_undone', 'public.demo_optin']::regclass[] loop
+    if not (select relrowsecurity from pg_catalog.pg_class where oid = v_t)
+       or pg_temp.policy_list(v_t) <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update' then
+      raise exception 'FAIL g: % should have RLS and 4 policies (got %)', v_t, pg_temp.policy_list(v_t);
+    end if;
+  end loop;
+  raise notice 'PASS g: skip_rls_autogen() skips (no RLS, no policies), also inside a savepoint, after rollback to it and after release; a call rolled back with its savepoint is undone; cleared -> RLS and 4 policies';
 end;
 $$;
 
--- g2. A plain set (not set local) also skips: it keeps the trigger off for every
--- later table on the connection. Each skipped table (here and in g) raises a
--- WARNING; SQL cannot assert a WARNING, so it shows in the output only. The
--- trigger must leave the value as it was. Restored with reset before going on.
+-- g2. Any value other than this transaction's token is ignored: the table gets RLS
+-- and its policies, and each statement raises one WARNING. A token with another
+-- transaction id stands for a value left by an earlier transaction. 'off', 'FALSE'
+-- and '0' with set local, and 'off' with a plain set, are ignored too. The trigger
+-- must leave the value as it was.
+do $$
+begin
+  perform pg_catalog.set_config('maintenance.rls_autogen',
+    'skip:' || (pg_catalog.pg_current_xact_id()::text::bigint - 1)::text, true);
+end;
+$$;
+create table public.demo_ignored_stale (id uuid primary key, user_id uuid references auth.users (id));
+set local maintenance.rls_autogen = 'off';
+create table public.demo_ignored_off (id uuid primary key, user_id uuid references auth.users (id));
+set local maintenance.rls_autogen = 'FALSE';
+create table public.demo_ignored_false (id uuid primary key, user_id uuid references auth.users (id));
+set local maintenance.rls_autogen = '0';
+create table public.demo_ignored_zero (id uuid primary key, user_id uuid references auth.users (id));
 set maintenance.rls_autogen = 'off';
-create table public.demo_optout_session (id uuid primary key, user_id uuid references auth.users (id));
-create table public.demo_optout_session_2 (id uuid primary key, user_id uuid references auth.users (id));
+create table public.demo_ignored_session (id uuid primary key, user_id uuid references auth.users (id));
 
 do $$
 declare
@@ -352,30 +410,19 @@ begin
     raise exception 'FAIL g2: the trigger changed maintenance.rls_autogen (now %)',
       pg_catalog.current_setting('maintenance.rls_autogen', true);
   end if;
-  foreach v_t in array array['public.demo_optout_session', 'public.demo_optout_session_2']::regclass[] loop
-    if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) or pg_temp.policy_list(v_t) <> '' then
-      raise exception 'FAIL g2: % got RLS or policies although a plain set switched the trigger off', v_t;
+  foreach v_t in array array['public.demo_ignored_stale', 'public.demo_ignored_off', 'public.demo_ignored_false',
+                             'public.demo_ignored_zero', 'public.demo_ignored_session']::regclass[] loop
+    if not (select relrowsecurity from pg_catalog.pg_class where oid = v_t)
+       or pg_temp.policy_list(v_t) <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update' then
+      raise exception 'FAIL g2: % should have RLS and 4 policies, the value was not this transaction''s token (got %)',
+        v_t, pg_temp.policy_list(v_t);
     end if;
   end loop;
+  raise notice 'PASS g2: a token of another transaction, off / FALSE / 0 with set local and off with a plain set are ignored -> RLS and 4 policies; value left as it was';
 end;
 $$;
 
-reset maintenance.rls_autogen;
-create table public.demo_optin_after_reset (id uuid primary key, user_id uuid references auth.users (id));
-
-do $$
-begin
-  if pg_catalog.lower(pg_catalog.btrim(coalesce(pg_catalog.current_setting('maintenance.rls_autogen', true), '')))
-       in ('off', 'false', '0') then
-    raise exception 'FAIL g2: maintenance.rls_autogen is still off after reset (set for the role, database or connection?)';
-  end if;
-  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_optin_after_reset'::regclass)
-     or pg_temp.policy_list('public.demo_optin_after_reset') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update' then
-    raise exception 'FAIL g2: trigger did not resume after reset maintenance.rls_autogen';
-  end if;
-  raise notice 'PASS g2: a plain set also skips every later table (no RLS, no policies) and the trigger leaves the value as it was; after reset -> RLS and 4 policies';
-end;
-$$;
+set local maintenance.rls_autogen = '';
 
 -- h. Edge cases.
 create table public.demo_two_owners (
@@ -485,12 +532,12 @@ $$;
 
 -- A policy someone already wrote under one of the fixed names is kept. Also covers the
 -- manual call for a table the trigger did not handle.
-set local maintenance.rls_autogen = 'off';
+select maintenance.skip_rls_autogen();
 create table public.demo_custom (
   id      uuid primary key default gen_random_uuid(),
   user_id uuid references auth.users (id)
 );
-set local maintenance.rls_autogen = 'on';
+set local maintenance.rls_autogen = '';
 create policy owner_select on public.demo_custom for select to authenticated using (false);
 
 do $$
@@ -699,9 +746,9 @@ create table demo_staging.demo_moved (
   user_id uuid references auth.users (id)
 );
 alter table demo_staging.demo_moved set schema public;
-set local maintenance.rls_autogen = 'off';
+select maintenance.skip_rls_autogen();
 create table public.demo_parted_2027 (like public.demo_parted including defaults);
-set local maintenance.rls_autogen = 'on';
+set local maintenance.rls_autogen = '';
 alter table public.demo_parted attach partition public.demo_parted_2027
   for values from ('2027-01-01') to ('2028-01-01');
 grant select, insert, update, delete on public.demo_moved, public.demo_parted_2027 to authenticated;
@@ -989,18 +1036,18 @@ $$;
 
 -- j2. The manual call by that owner works with the two grants. Without usage on
 -- schema auth it enables RLS and adds no policies; with it, the four policies.
-set local maintenance.rls_autogen = 'off';
+select maintenance.skip_rls_autogen();
 set local role demo_role;
 create table public.demo_role_manual (id uuid primary key, user_id uuid);
 reset role;
-set local maintenance.rls_autogen = 'on';
+set local maintenance.rls_autogen = '';
 
 do $$
 declare
   v_t regclass := 'public.demo_role_manual';
 begin
   if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) then
-    raise exception 'FAIL j2: setup: % has RLS although the trigger was switched off', v_t;
+    raise exception 'FAIL j2: setup: % has RLS although maintenance.skip_rls_autogen() was called', v_t;
   end if;
   perform pg_catalog.set_config('role', 'demo_role', true);
   perform maintenance.apply_owner_policies(v_t);

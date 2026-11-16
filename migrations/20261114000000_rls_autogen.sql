@@ -10,10 +10,12 @@
 --   owner_delete, each limited to (select auth.uid()) = <owner column>. The
 --   owner can read, add, change and delete their own rows.
 --   The owner column is a uuid column with a single-column foreign key to
---   auth.users(id); with several, user_id is used, then owner_id. Only when there
---   is no such column, a uuid column named user_id, else owner_id, that has no
---   foreign key at all is the owner by its name. A domain over uuid counts as
---   uuid. With no owner column, or without auth.users, the table gets RLS and no
+--   auth.users(id); with several, user_id is used, else owner_id, else none.
+--   Only when there is no such column, the name rule applies: it takes the uuid
+--   column user_id or, only if there is no uuid user_id, owner_id, and uses it
+--   only if that column has no foreign key at all. So a user_id with any foreign
+--   key means no policies, even if a plain owner_id exists. A domain over uuid
+--   counts as uuid. With no owner column, or without auth.users, the table gets RLS and no
 --   policies, so it is deny-all for anon and authenticated. A notice says which
 --   case applied. When the table has an owner column but auth.uid() or the role
 --   authenticated is missing, or the caller has no usage on schema auth, it gets
@@ -33,12 +35,17 @@
 --   missing between its drop and its create.
 --
 -- Opt out for the tables created in one transaction
---   set local maintenance.rls_autogen = 'off';
---   Only set local is supported. Set at any other level, the switch keeps the
---   trigger off for every later table until it is cleared. Each skipped table
---   raises a WARNING.
+--   begin; select maintenance.skip_rls_autogen(); create table ...; commit;
+--   The function sets maintenance.rls_autogen to 'skip:<transaction id>' for the
+--   current transaction only. The trigger skips a table only when the value is
+--   exactly that for the transaction it runs in, and raises a WARNING naming the
+--   table. Any other value ('off', a token of an earlier transaction, a plain set,
+--   a role, database, server or connection value) is ignored: tables are protected
+--   and one WARNING per statement says the value was ignored.
 --
 -- Known limits (see README.md)
+--   - The opt-out covers every table created in public for the rest of its
+--     transaction, extension tables included.
 --   - Not covered: views, materialized views, foreign tables, tables created
 --     inside CREATE SCHEMA, tables moved in with SET SCHEMA, partitions added
 --     with ATTACH PARTITION, foreign keys added later, and tables that existed
@@ -189,6 +196,22 @@ begin
 end;
 $$;
 
+-- Opt out for the rest of the current transaction. The token is the top-level
+-- transaction id (the same inside a savepoint). pg_current_xact_id() is used, not
+-- the deprecated txid_current(); its 64-bit value includes the epoch, so it is not
+-- reused after wraparound.
+create or replace function maintenance.skip_rls_autogen()
+returns void
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+begin
+  perform pg_catalog.set_config('maintenance.rls_autogen',
+    'skip:' || pg_catalog.pg_current_xact_id()::text, true);
+end;
+$$;
+
 -- Event trigger function: applies the above to each new table in the watched schemas.
 create or replace function maintenance.rls_autogen()
 returns event_trigger
@@ -200,33 +223,18 @@ declare
   -- Watched schemas. Add names here to cover more schemas.
   c_schemas constant text[] := array['public'];
   v_value  text := coalesce(pg_catalog.current_setting('maintenance.rls_autogen', true), '');
-  v_off    boolean := pg_catalog.lower(pg_catalog.btrim(v_value)) in ('off', 'false', '0');
-  v_reset  text;
-  v_skip   text;
+  v_skip   boolean := false;
+  v_stale  boolean := false;
   v_oid    oid;
   v_in_ext boolean;
   v_ext    name;
 begin
-  if v_off then
-    -- Read the value RESET would return, which comes from the role, the database,
-    -- the connection options or the server configuration. The subtransaction is
-    -- rolled back, so the current value is left exactly as it was. A plain SET and
-    -- SET LOCAL cannot be told apart from SQL, so both get the first message.
-    begin
-      execute 'reset maintenance.rls_autogen';
-      v_reset := coalesce(pg_catalog.current_setting('maintenance.rls_autogen', true), '');
-      raise exception 'rls_autogen: probe';
-    exception when raise_exception then
-      null;
-    end;
-    if pg_catalog.lower(pg_catalog.btrim(v_reset)) in ('off', 'false', '0') then
-      v_skip := 'It is stored outside this session (for a role, a database, the connection options or the server '
-                'configuration), so every later table on this connection is skipped too. The "Opt out" section of '
-                'README.md lists how to find and clear it.';
-    else
-      v_skip := 'Only set local inside a transaction is supported; a plain set keeps it off for every later table '
-                'on this connection until reset maintenance.rls_autogen.';
-    end if;
+  if v_value <> '' then
+    -- Only the token of this (top-level) transaction skips. A transaction id is
+    -- never reused, so a value left by an earlier transaction, or stored for a
+    -- role, a database, the server or the connection, can never match.
+    v_skip  := v_value = 'skip:' || pg_catalog.pg_current_xact_id()::text;
+    v_stale := not v_skip;
   end if;
 
   for v_oid, v_in_ext in
@@ -241,11 +249,16 @@ begin
      group by c.oid
      order by c.oid
   loop
-    if v_off then
-      -- WARNING, not NOTICE, so it shows at default client settings.
-      raise warning 'rls_autogen: RLS was NOT enabled on % because maintenance.rls_autogen is off (%). %',
-        v_oid::pg_catalog.regclass, pg_catalog.quote_literal(v_value), v_skip;
+    -- WARNING, not NOTICE, so both show at default client settings.
+    if v_skip then
+      raise warning 'rls_autogen: RLS is not enabled on %: maintenance.skip_rls_autogen() was called in this transaction.',
+        v_oid::pg_catalog.regclass;
       continue;
+    end if;
+    if v_stale then
+      raise warning 'rls_autogen: ignored maintenance.rls_autogen = %; tables are protected as usual. The supported opt-out is select maintenance.skip_rls_autogen(); inside the same transaction.',
+        pg_catalog.quote_literal(v_value);
+      v_stale := false;
     end if;
     begin
       if v_in_ext then
@@ -277,6 +290,7 @@ end;
 $$;
 
 revoke all on function maintenance.apply_owner_policies(regclass) from public;
+revoke all on function maintenance.skip_rls_autogen() from public;
 revoke all on function maintenance.rls_autogen() from public;
 
 -- Revokes for anon and authenticated, and grants to postgres, for the roles that exist.
@@ -290,6 +304,7 @@ begin
     if exists (select 1 from pg_catalog.pg_roles where rolname = v_role) then
       execute pg_catalog.format('revoke all on schema maintenance from %I', v_role);
       execute pg_catalog.format('revoke all on function maintenance.apply_owner_policies(regclass) from %I', v_role);
+      execute pg_catalog.format('revoke all on function maintenance.skip_rls_autogen() from %I', v_role);
       execute pg_catalog.format('revoke all on function maintenance.rls_autogen() from %I', v_role);
     else
       raise notice 'rls_autogen: role % does not exist; its revoke was skipped', v_role;
@@ -298,6 +313,7 @@ begin
   if exists (select 1 from pg_catalog.pg_roles where rolname = 'postgres') then
     grant usage on schema maintenance to postgres;
     grant execute on function maintenance.apply_owner_policies(regclass) to postgres;
+    grant execute on function maintenance.skip_rls_autogen() to postgres;
   else
     raise notice 'rls_autogen: role postgres does not exist; its grant was skipped';
   end if;

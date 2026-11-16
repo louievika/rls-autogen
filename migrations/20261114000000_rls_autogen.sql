@@ -13,7 +13,12 @@
 --   its name alone. Foreign key columns always win over the name fallback. A table
 --   without policies is deny-all for anon and authenticated. Existing policies with these names are kept as they are.
 --   Grants are not changed. Re-running this file is safe.
---   Tables created by an extension script (CREATE EXTENSION) are left alone.
+--   A table created by an extension script (CREATE EXTENSION or ALTER EXTENSION
+--   UPDATE) also gets RLS enabled, but never owner policies: no owner column is
+--   guessed on an extension's table. A WARNING names the table and its extension
+--   (a NOTICE would be hidden, since Postgres shows only WARNING and above while
+--   an extension script runs).
+--   It is locked for anon and authenticated until you add a policy yourself.
 --
 -- Opt out for the tables created in one transaction
 --   set local maintenance.rls_autogen = 'off';
@@ -22,6 +27,9 @@
 --   - A foreign key added later with ALTER TABLE does not fire the trigger. Run
 --     select maintenance.apply_owner_policies('public.your_table');
 --   - Tables that existed before this migration are not changed. Same call.
+--   - Extension tables get RLS and no policies. A function or query that reads one
+--     as an API role (for example a coordinate transform reading its reference
+--     table) gets no rows until you add a read policy for that role.
 --   - Table owners, roles with BYPASSRLS and service_role bypass RLS by design.
 --   - On hosted Supabase, event triggers do not fire for superuser or reserved
 --     roles (supabase_admin, service_role, anon, authenticated and others).
@@ -126,14 +134,16 @@ declare
   c_schemas constant text[] := array['public'];
   v_setting text := pg_catalog.lower(pg_catalog.btrim(
                       coalesce(pg_catalog.current_setting('maintenance.rls_autogen', true), '')));
-  v_oid oid;
+  v_oid    oid;
+  v_in_ext boolean;
+  v_ext    name;
 begin
   if v_setting in ('off', 'false', '0') then
     return;
   end if;
 
-  for v_oid in
-    select distinct c.oid
+  for v_oid, v_in_ext in
+    select c.oid, pg_catalog.bool_or(d.in_extension)
       from pg_catalog.pg_event_trigger_ddl_commands() d
       join pg_catalog.pg_class c on c.oid = d.objid
       join pg_catalog.pg_namespace n on n.oid = c.relnamespace
@@ -141,11 +151,28 @@ begin
        and d.object_type = 'table'
        and c.relkind in ('r', 'p')
        and n.nspname = any (c_schemas)
-       and not d.in_extension
+     group by c.oid
      order by c.oid
   loop
     begin
-      perform maintenance.apply_owner_policies(v_oid::pg_catalog.regclass);
+      if v_in_ext then
+        -- Created by an extension script: lock it, but never guess an owner column.
+        execute pg_catalog.format('alter table %s enable row level security', v_oid::pg_catalog.regclass);
+        select e.extname into v_ext
+          from pg_catalog.pg_depend dep
+          join pg_catalog.pg_extension e on e.oid = dep.refobjid
+         where dep.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+           and dep.objid = v_oid
+           and dep.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+           and dep.deptype = 'e'
+         limit 1;
+        -- WARNING, not NOTICE: Postgres hides messages below WARNING while an
+        -- extension script runs.
+        raise warning 'rls_autogen: % was created by extension %; RLS is on, no policies created (owner columns are not guessed on extension tables). It is locked for anon and authenticated; add a policy yourself if API roles need it.',
+          v_oid::pg_catalog.regclass, coalesce(v_ext, '(unknown)');
+      else
+        perform maintenance.apply_owner_policies(v_oid::pg_catalog.regclass);
+      end if;
     exception when insufficient_privilege then
       raise exception 'rls_autogen: could not secure %: %', v_oid::pg_catalog.regclass, sqlerrm
         using errcode = 'insufficient_privilege',

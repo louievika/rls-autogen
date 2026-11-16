@@ -8,8 +8,12 @@
 -- It creates tables named public.demo_* and two throwaway rows in auth.users with random ids.
 -- Any trigger you have on auth.users runs for those two rows (and is rolled back with them).
 --
--- Each check raises NOTICE 'PASS: ...' or stops with ERROR 'FAIL: ...'.
--- The last line of a good run is NOTICE 'ALL CHECKS PASSED'.
+-- Each check raises NOTICE 'PASS: ...' or stops with ERROR 'FAIL: ...'. Check h10
+-- (extension tables) raises NOTICE 'SKIP h10: ...' instead when neither pg_partman
+-- nor postgis is available and not installed yet.
+-- The last line of a good run is NOTICE 'ALL CHECKS PASSED'. If a check was
+-- skipped it reads NOTICE 'ALL CHECKS PASSED (1 skipped: h10)', which is not a
+-- full pass: the skipped check was not tested.
 
 begin;
 
@@ -508,10 +512,13 @@ begin
 end;
 $$;
 
--- Tables an extension script creates in public are left alone. Uses each of these
--- extensions that is available and not installed yet (both create a table in the
--- schema they are installed into). Rolled back with the rest. Prints SKIP h10 when
--- none can be created here.
+-- Tables an extension script creates in public get RLS and no policies. Takes the
+-- first of these extensions that is available and not installed yet (both create a
+-- table in the schema they are installed into), creates it in public and checks
+-- every table it put there. Any error from create extension is a FAIL. A second
+-- extension is only tried when the first put no table in public. Rolled back with
+-- the rest. When none of them is available, prints SKIP h10 and the final line
+-- reports the skip.
 do $$
 declare
   v_ext    text;
@@ -524,11 +531,7 @@ begin
     begin
       execute pg_catalog.format('create extension %I schema public', v_ext);
     exception when others then
-      if sqlerrm like 'rls_autogen:%' then
-        raise exception 'FAIL h10: the trigger acted on create extension %: %', v_ext, sqlerrm;
-      end if;
-      raise notice 'h10: create extension % failed here (%), not used', v_ext, sqlerrm;
-      continue;
+      raise exception 'FAIL h10: create extension % raised an error: %', v_ext, sqlerrm;
     end;
     for v_t in
       select c.oid::regclass
@@ -543,17 +546,22 @@ begin
          and c.relkind in ('r', 'p')
        order by c.oid
     loop
-      if (select relrowsecurity from pg_catalog.pg_class where oid = v_t)
-         or pg_temp.policy_list(v_t) <> '' then
-        raise exception 'FAIL h10: % (created by extension %) got RLS or policies', v_t, v_ext;
+      if not (select relrowsecurity from pg_catalog.pg_class where oid = v_t) then
+        raise exception 'FAIL h10: % (created by extension %) has no RLS', v_t, v_ext;
+      end if;
+      if pg_temp.policy_list(v_t) <> '' then
+        raise exception 'FAIL h10: % (created by extension %) got policies: %', v_t, v_ext, pg_temp.policy_list(v_t);
       end if;
       v_tested := v_tested || (v_t::text || ' (' || v_ext || ')');
     end loop;
+    exit when pg_catalog.cardinality(v_tested) > 0;
   end loop;
   if pg_catalog.cardinality(v_tested) = 0 then
-    raise notice 'SKIP h10: no extension that creates a table in public could be created here; extension tables not tested';
+    perform pg_catalog.set_config('verify.skipped',
+      pg_catalog.concat_ws(',', nullif(pg_catalog.current_setting('verify.skipped', true), ''), 'h10'), true);
+    raise notice 'SKIP h10: none of pg_partman, postgis is available and not installed yet; extension tables not tested';
   else
-    raise notice 'PASS h10: tables created by create extension are left alone (no RLS, 0 policies): %',
+    raise notice 'PASS h10: tables created by create extension get RLS and 0 policies: %',
       pg_catalog.array_to_string(v_tested, ', ');
   end if;
 end;
@@ -677,8 +685,16 @@ end;
 $$;
 
 do $$
+declare
+  v_skipped text[] := pg_catalog.string_to_array(
+                        nullif(pg_catalog.current_setting('verify.skipped', true), ''), ',');
 begin
-  raise notice 'ALL CHECKS PASSED';
+  if pg_catalog.cardinality(v_skipped) > 0 then
+    raise notice 'ALL CHECKS PASSED (% skipped: %)',
+      pg_catalog.cardinality(v_skipped), pg_catalog.array_to_string(v_skipped, ', ');
+  else
+    raise notice 'ALL CHECKS PASSED';
+  end if;
 end;
 $$;
 

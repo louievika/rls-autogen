@@ -13,6 +13,7 @@
 --   its name alone. Foreign key columns always win over the name fallback. A table
 --   without policies is deny-all for anon and authenticated. Existing policies with these names are kept as they are.
 --   Grants are not changed. Re-running this file is safe.
+--   Tables created by an extension script (CREATE EXTENSION) are left alone.
 --
 -- Opt out for the tables created in one transaction
 --   set local maintenance.rls_autogen = 'off';
@@ -140,6 +141,7 @@ begin
        and d.object_type = 'table'
        and c.relkind in ('r', 'p')
        and n.nspname = any (c_schemas)
+       and not d.in_extension
      order by c.oid
   loop
     begin

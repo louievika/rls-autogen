@@ -50,7 +50,7 @@ Only when the table has no such foreign key column, a name fallback applies: a `
 
 If no owner column is found, the table gets RLS and no policies, so it is deny-all for `anon` and `authenticated` until you add your own. A notice says which case applied.
 
-Policies that already exist under one of the four names are left as they are. Grants are not changed. Partitioned tables and partitions are both handled. `CREATE TABLE AS` and `SELECT INTO` are covered.
+Policies that already exist under one of the four names are left as they are. Grants are not changed. Partitioned tables and partitions are both handled. `CREATE TABLE AS` and `SELECT INTO` are covered. Tables that an extension script creates (for example during `create extension`) are left alone, so the extension keeps working as it was built; secure them yourself if you expose them.
 
 Opt out for the tables created in one transaction:
 
@@ -83,7 +83,7 @@ psql "$DATABASE_URL" -f test/verify.sql
 
 Or paste it into the SQL editor and choose "Run without RLS" when asked. A good run shows Success; the PASS notices appear only in psql. It takes a few seconds.
 
-It runs in one transaction that ends in `rollback`, so it leaves nothing behind. It creates tables named `public.demo_*` and stops with an error if one already exists. It also creates two `auth.users` rows with random ids, then acts as `anon` and as two signed-in users the way the Data API does (`set local role` plus `request.jwt.claims`). It checks: RLS on, the four policies, anon denied, owner allowed on their own rows only, another user denied, no-owner tables deny-all, the opt-out, owner column choice, the name fallback (`user_id` or `owner_id` without a foreign key, non-uuid columns ignored, foreign key wins), quoted and unusual table names, re-runs, existing policies kept, `CREATE TABLE AS`, `SELECT INTO`, partitions, and that other schemas and temporary tables are left alone.
+It runs in one transaction that ends in `rollback`, so it leaves nothing behind. It creates tables named `public.demo_*` and stops with an error if one already exists. It also creates two `auth.users` rows with random ids, then acts as `anon` and as two signed-in users the way the Data API does (`set local role` plus `request.jwt.claims`). It checks: RLS on, the four policies, anon denied, owner allowed on their own rows only, another user denied, no-owner tables deny-all, the opt-out, owner column choice, the name fallback (`user_id` or `owner_id` without a foreign key, non-uuid columns ignored, foreign key wins), quoted and unusual table names, re-runs, existing policies kept, `CREATE TABLE AS`, `SELECT INTO`, partitions, and that other schemas, temporary tables and tables created by an extension are left alone. The extension check creates `pg_partman` and `postgis` in `public` inside the same transaction, each one that is available and not installed yet; if neither can be created, it prints `NOTICE:  SKIP h10` instead of a PASS.
 
 A good run prints one `NOTICE:  PASS ...` line per check and ends with:
 

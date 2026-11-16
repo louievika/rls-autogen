@@ -508,6 +508,57 @@ begin
 end;
 $$;
 
+-- Tables an extension script creates in public are left alone. Uses each of these
+-- extensions that is available and not installed yet (both create a table in the
+-- schema they are installed into). Rolled back with the rest. Prints SKIP h10 when
+-- none can be created here.
+do $$
+declare
+  v_ext    text;
+  v_t      regclass;
+  v_tested text[] := '{}';
+begin
+  foreach v_ext in array array['pg_partman', 'postgis'] loop
+    continue when not exists (select 1 from pg_catalog.pg_available_extensions
+                               where name = v_ext and installed_version is null);
+    begin
+      execute pg_catalog.format('create extension %I schema public', v_ext);
+    exception when others then
+      if sqlerrm like 'rls_autogen:%' then
+        raise exception 'FAIL h10: the trigger acted on create extension %: %', v_ext, sqlerrm;
+      end if;
+      raise notice 'h10: create extension % failed here (%), not used', v_ext, sqlerrm;
+      continue;
+    end;
+    for v_t in
+      select c.oid::regclass
+        from pg_catalog.pg_depend d
+        join pg_catalog.pg_class c on c.oid = d.objid
+        join pg_catalog.pg_extension e on e.oid = d.refobjid
+       where d.classid = 'pg_catalog.pg_class'::regclass
+         and d.refclassid = 'pg_catalog.pg_extension'::regclass
+         and d.deptype = 'e'
+         and e.extname = v_ext
+         and c.relnamespace = 'public'::regnamespace
+         and c.relkind in ('r', 'p')
+       order by c.oid
+    loop
+      if (select relrowsecurity from pg_catalog.pg_class where oid = v_t)
+         or pg_temp.policy_list(v_t) <> '' then
+        raise exception 'FAIL h10: % (created by extension %) got RLS or policies', v_t, v_ext;
+      end if;
+      v_tested := v_tested || (v_t::text || ' (' || v_ext || ')');
+    end loop;
+  end loop;
+  if pg_catalog.cardinality(v_tested) = 0 then
+    raise notice 'SKIP h10: no extension that creates a table in public could be created here; extension tables not tested';
+  else
+    raise notice 'PASS h10: tables created by create extension are left alone (no RLS, 0 policies): %',
+      pg_catalog.array_to_string(v_tested, ', ');
+  end if;
+end;
+$$;
+
 -- i. Name fallback, used only when no uuid foreign key to auth.users exists.
 create table public.demo_name_user (
   id      uuid primary key default gen_random_uuid(),

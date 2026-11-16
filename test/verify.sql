@@ -11,7 +11,8 @@
 -- It creates tables and domains named public.demo_*, two more tables in public
 -- with quoted names (public."Demo Table" and the injection test table
 -- public."demo_x""); drop table public.demo_posts; --"), the schemas
--- demo_other_schema and demo_staging, the role demo_role (checks g1 and j0 to j2), a temporary
+-- demo_other_schema and demo_staging, the role demo_role (checks g1, g3 and j0 to j2), the
+-- function public.demo_definer_make(text) (check g3), a temporary
 -- table and two temporary functions, two throwaway rows in auth.users with random
 -- ids, and the first of the extensions pg_partman and postgis that is available
 -- and not installed yet and can be created (check h10).
@@ -25,26 +26,35 @@
 -- Check h10 (extension tables) prints SKIP h10 instead of PASS when neither pg_partman
 -- nor postgis is available, not installed yet and can be created, or when each one
 -- it creates ran its script as another role for whom the trigger did not fire
--- (not a test of the trigger). Check j2 prints SKIP j2 when this role cannot
+-- (not a test of the trigger). Check h12 prints SKIP h12 when this role may not set
+-- session_replication_role. Check j2 prints SKIP j2 when this role cannot
 -- grant authenticated to demo_role (its way to usage on schema auth).
--- h10 and j2 are the only checks that can print SKIP. The last line of a good run
--- is one of:
+-- h10, h12 and j2 are the only checks that can print SKIP. The last line of a good
+-- run is one of:
 --   NOTICE 'ALL CHECKS PASSED'
 --   NOTICE 'ALL CHECKS PASSED (1 skipped: h10)'
+--   NOTICE 'ALL CHECKS PASSED (1 skipped: h12)'
 --   NOTICE 'ALL CHECKS PASSED (1 skipped: j2)'
+--   NOTICE 'ALL CHECKS PASSED (2 skipped: h10, h12)'
 --   NOTICE 'ALL CHECKS PASSED (2 skipped: h10, j2)'
+--   NOTICE 'ALL CHECKS PASSED (2 skipped: h12, j2)'
+--   NOTICE 'ALL CHECKS PASSED (3 skipped: h10, h12, j2)'
 -- Only the first is a full pass; a skipped check was not tested.
 -- Checks g, g1, h6, h11 and j2 opt out on purpose, so each table they skip prints
--- WARNING 'rls_autogen: RLS is not enabled on ...'. Checks g1, g2 and j2 set values
--- that must be ignored, so each of those statements prints WARNING 'rls_autogen:
--- ignored maintenance.rls_autogen = ...'. Checks g1 and j0 print WARNING
+-- WARNING 'rls_autogen: RLS is not enabled on ...'. Checks g1, g2, g3 and j2 set
+-- values that must be ignored, so each of those statements prints WARNING
+-- 'rls_autogen: ignored maintenance.rls_autogen = ...'. Checks g1 and j0 print WARNING
 -- 'rls_autogen: ... is locked (RLS on, no policies): owner policies were not added
--- because role demo_role lacks ...' for their two tables each. Checks j1 and j2
+-- because role demo_role lacks ...' for their two tables each, check g3 for its one
+-- table. Checks j1 and j2
 -- print WARNING 'rls_autogen: ... has owner column ..., but ...' for demo_role's
 -- tables. All are expected.
 -- The opt-out across transactions and in autocommit mode cannot be shown inside
 -- this file's single transaction; check g2 uses a token with another transaction
--- id and one with another start time instead.
+-- id and one with another start time instead. Nor can a login role without the
+-- opt-out grants: in this file session_user is always the role that logged in to run
+-- it, so checks g1 and g3 show only the current_user side of the rule that both
+-- current_user and session_user need the opt-out grants.
 
 begin;
 -- Predicate checks read policies back as text; pin the path so they print auth.uid().
@@ -98,9 +108,13 @@ declare
   v_fn   text;
   v_cfg  text[];
 begin
-  if not exists (select 1 from pg_catalog.pg_event_trigger
-                  where evtname = 'rls_autogen' and evtenabled <> 'D') then
-    raise exception 'FAIL 0: event trigger rls_autogen is missing or disabled';
+  if not exists (select 1 from pg_catalog.pg_event_trigger where evtname = 'rls_autogen') then
+    raise exception 'FAIL 0: event trigger rls_autogen is missing';
+  end if;
+  -- 'A' (enable always): it fires also with session_replication_role = replica.
+  if (select evtenabled from pg_catalog.pg_event_trigger where evtname = 'rls_autogen') is distinct from 'A' then
+    raise exception 'FAIL 0: event trigger rls_autogen has evtenabled = %, expected A (alter event trigger rls_autogen enable always), so it does not fire in every session_replication_role mode',
+      (select evtenabled from pg_catalog.pg_event_trigger where evtname = 'rls_autogen');
   end if;
   begin
     create table public.demo_probe_0 (id int);
@@ -135,6 +149,12 @@ begin
     raise exception 'FAIL 0: role % lacks %; the owner of schema maintenance and of its functions (or a superuser) can grant them, or run this file as the role that installed it',
       current_user, pg_catalog.array_to_string(v_lack, ' and ');
   end if;
+  -- The opt-out checks also need the login role to hold the opt-out grants.
+  if not pg_catalog.has_schema_privilege(session_user, 'maintenance', 'USAGE')
+     or not pg_catalog.has_function_privilege(session_user, 'maintenance.skip_rls_autogen()', 'EXECUTE') then
+    raise exception 'FAIL 0: session user % lacks usage on schema maintenance or execute on maintenance.skip_rls_autogen(); the opt-out counts only when the session user has them too. Log in as a role that has them to run this file',
+      session_user;
+  end if;
   -- Each function runs with search_path pg_catalog, then pg_temp last.
   foreach v_fn in array array['apply_owner_policies', 'skip_rls_autogen', 'rls_autogen'] loop
     select p.proconfig into v_cfg
@@ -152,7 +172,7 @@ begin
     raise exception 'FAIL 0: role simulation broken (current_user %, auth.uid() %)', current_user, v_uid;
   end if;
   reset role;
-  raise notice 'PASS 0: event trigger installed and fires for %, which has usage on schema maintenance and execute on apply_owner_policies and skip_rls_autogen; the three functions run with search_path pg_catalog, pg_temp; auth.uid() returns the simulated user', current_user;
+  raise notice 'PASS 0: event trigger installed, enabled always (evtenabled A), and fires for %, which, like the session user, has usage on schema maintenance and execute on apply_owner_policies and skip_rls_autogen; the three functions run with search_path pg_catalog, pg_temp; auth.uid() returns the simulated user', current_user;
 end;
 $$;
 
@@ -556,6 +576,55 @@ $$;
 
 set local maintenance.rls_autogen = '';
 
+-- g3. The token counts only when current_user holds the opt-out grants, also inside
+-- a function that runs with its owner's rights, where current_user is the owner.
+-- The role running this file (which, like session_user, has the grants) calls
+-- maintenance.skip_rls_autogen(), then a function owned by demo_role, which has
+-- neither grant. The table the function creates is owned by demo_role and is
+-- protected (locked, since demo_role also lacks the policy grants), and the statement
+-- prints WARNING 'rls_autogen: ignored maintenance.rls_autogen = ...: role demo_role
+-- lacks ...'. The session_user side needs a second login and is not shown here.
+set local role demo_role;
+create function public.demo_definer_make(p_name text)
+returns void
+language plpgsql
+security definer
+set search_path = pg_catalog, pg_temp
+as $$
+begin
+  execute pg_catalog.format('create table public.%I (id uuid primary key, user_id uuid)', p_name);
+end;
+$$;
+revoke all on function public.demo_definer_make(text) from public;
+reset role;
+
+do $$
+begin
+  if pg_catalog.has_schema_privilege('demo_role', 'maintenance', 'USAGE')
+     or pg_catalog.has_function_privilege('demo_role', 'maintenance.skip_rls_autogen()', 'EXECUTE') then
+    raise exception 'FAIL g3: setup: demo_role already has usage on schema maintenance or execute on maintenance.skip_rls_autogen()';
+  end if;
+  perform maintenance.skip_rls_autogen();
+  begin
+    perform public.demo_definer_make('demo_definer_t');
+  exception when others then
+    raise exception 'FAIL g3: a function owned by demo_role creating a table after the opt-out call raised an error: %', sqlerrm;
+  end;
+  perform pg_catalog.set_config('maintenance.rls_autogen', '', true);
+  if not exists (select 1 from pg_catalog.pg_class
+                  where oid = 'public.demo_definer_t'::regclass and relowner = 'demo_role'::regrole) then
+    raise exception 'FAIL g3: public.demo_definer_t is not owned by demo_role, so the function did not run with its owner''s rights';
+  end if;
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_definer_t'::regclass) is not true
+     or pg_temp.policy_list('public.demo_definer_t') <> '' then
+    raise exception 'FAIL g3: inside a function owned by demo_role (no opt-out grants) the token should be ignored; demo_definer_t should be locked, RLS on and no policies (got RLS %, policies %)',
+      (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_definer_t'::regclass),
+      pg_temp.policy_list('public.demo_definer_t');
+  end if;
+  raise notice 'PASS g3: % called maintenance.skip_rls_autogen(), then a function owned by demo_role (no opt-out grants) running with its owner''s rights -> the token is ignored and its table is locked (RLS on, 0 policies)', current_user;
+end;
+$$;
+
 -- h. Edge cases.
 create table public.demo_two_owners (
   id          uuid primary key default gen_random_uuid(),
@@ -925,6 +994,35 @@ begin
   if v_n <> 0 then raise exception 'FAIL h11: other user sees % rows in the attached partition after the manual call', v_n; end if;
   reset role;
   raise notice 'PASS h11: documented limit: set schema public and attach partition leave RLS off (other user read the attached partition directly); manual call adds RLS and 4 policies';
+end;
+$$;
+
+-- h12. Replica mode. Data-load and restore scripts often set session_replication_role
+-- = replica; an event trigger in the default mode does not fire then. rls_autogen is
+-- enabled always (check 0), so a table created in replica mode still gets RLS and
+-- its policies. Prints SKIP h12 when this role may not set session_replication_role.
+do $$
+declare
+  v_prev text := pg_catalog.current_setting('session_replication_role');
+begin
+  begin
+    perform pg_catalog.set_config('session_replication_role', 'replica', true);
+  exception when insufficient_privilege then
+    perform pg_catalog.set_config('verify.skipped',
+      pg_catalog.concat_ws(',', nullif(pg_catalog.current_setting('verify.skipped', true), ''), 'h12'), true);
+    raise notice 'SKIP h12: % may not set session_replication_role (%), so a table created in replica mode was not tested; check 0 still checked that the trigger is enabled always',
+      current_user, sqlerrm;
+    return;
+  end;
+  create table public.demo_replica (id uuid primary key, user_id uuid references auth.users (id));
+  perform pg_catalog.set_config('session_replication_role', v_prev, true);
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_replica'::regclass) is not true
+     or pg_temp.policy_list('public.demo_replica') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update' then
+    raise exception 'FAIL h12: a table created with session_replication_role = replica should have RLS and 4 policies (got RLS %, policies %)',
+      (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_replica'::regclass),
+      pg_temp.policy_list('public.demo_replica');
+  end if;
+  raise notice 'PASS h12: a table created with session_replication_role = replica gets RLS and 4 policies';
 end;
 $$;
 

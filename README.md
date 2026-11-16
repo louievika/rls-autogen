@@ -52,7 +52,20 @@ If no owner column is found, the table gets RLS and no policies, so it is deny-a
 
 Policies that already exist under one of the four names are left as they are. Grants are not changed. Partitioned tables and partitions created with `partition of` are both handled. `CREATE TABLE AS` and `SELECT INTO` are covered.
 
-A table that an extension script creates in `public`, during `create extension` or `alter extension ... update`, gets RLS enabled and no policies: no owner column is guessed on an extension's table. A `WARNING` names the table and the extension and says it is locked with no policies. It is a warning, not a notice, because Postgres hides messages below `WARNING` while an extension script runs. If `anon` or `authenticated` need the table, add a policy yourself. This includes a function that reads such a table while running as an API role, for example a coordinate transform reading its reference table: it gets no rows until you add a read policy for that role.
+A table that an extension script creates in `public`, during `create extension` or `alter extension ... update`, is handled in one of two ways, depending on which role runs the script:
+
+- The script runs as the role that ran the command, and that role is not a superuser: the trigger fires. The table gets RLS enabled and no policies: no owner column is guessed on an extension's table. A `WARNING` names the table and the extension and says it is locked with no policies. It is a warning, not a notice, because Postgres hides messages below `WARNING` while an extension script runs. If `anon` or `authenticated` need the table, add a policy yourself. This includes a function that reads such a table while running as an API role, for example a coordinate transform reading its reference table: it gets no rows until you add a read policy for that role.
+- The script runs as a superuser: the table is not touched and no message is shown, because event triggers do not fire for superusers. It keeps RLS off. Check such tables and secure them yourself.
+
+To list the tables in `public` that have RLS off:
+
+```sql
+select c.oid::regclass as table_name, c.relowner::regrole as owner
+  from pg_catalog.pg_class c
+ where c.relnamespace = 'public'::regnamespace
+   and c.relkind in ('r', 'p')
+   and not c.relrowsecurity;
+```
 
 Opt out for the tables created in one transaction:
 
@@ -85,7 +98,7 @@ psql "$DATABASE_URL" -f test/verify.sql
 
 Or paste it into the SQL editor and choose "Run without RLS" when asked. A good run shows Success; the PASS notices appear only in psql. It takes a few seconds.
 
-It runs in one transaction that ends in `rollback`, so it leaves nothing behind. It creates tables named `public.demo_*` and stops with an error if one already exists. It also creates two `auth.users` rows with random ids, then acts as `anon` and as two signed-in users the way the Data API does (`set local role` plus `request.jwt.claims`). It checks: RLS on, the four policies, anon denied, owner allowed on their own rows only, another user denied, no-owner tables deny-all, the opt-out, owner column choice, the name fallback (`user_id` or `owner_id` without a foreign key, non-uuid columns ignored, foreign key wins), quoted and unusual table names, re-runs, existing policies kept, `CREATE TABLE AS`, `SELECT INTO`, partitions, that other schemas and temporary tables are left alone, and that tables created by an extension get RLS and no policies (check h10). For h10 it creates the first of `pg_partman` and `postgis` that is available and not installed yet in `public`, inside the same transaction, and checks every table that extension put there. It tries `postgis` only if `pg_partman` put no table in `public`. Any error from that `create extension` is a FAIL. Check h11 pins a documented limit: a table moved into `public` with `set schema` and a partition attached with `attach partition` keep RLS off until the manual call.
+It runs in one transaction that ends in `rollback`, so it leaves nothing behind. It creates tables named `public.demo_*` and stops with an error if one already exists. It also creates two `auth.users` rows with random ids, then acts as `anon` and as two signed-in users the way the Data API does (`set local role` plus `request.jwt.claims`). It checks: RLS on, the four policies, anon denied, owner allowed on their own rows only, another user denied, no-owner tables deny-all, the opt-out, owner column choice, the name fallback (`user_id` or `owner_id` without a foreign key, non-uuid columns ignored, foreign key wins), quoted and unusual table names, re-runs, existing policies kept, `CREATE TABLE AS`, `SELECT INTO`, partitions, that other schemas and temporary tables are left alone, and that tables created by an extension get RLS and no policies (check h10). For h10 it creates the first of `pg_partman` and `postgis` that is available and not installed yet in `public`, inside the same transaction, and checks every table that extension put there. A table counts as a test of the trigger only when it is owned by the current role and that role is not a superuser, which shows the script ran as that role; a table owned by another role, such as a superuser, is recorded as not a test of the trigger. It tries `postgis` only if `pg_partman` tested no table. Any error from that `create extension` is a FAIL. Check h11 pins a documented limit: a table moved into `public` with `set schema` and a partition attached with `attach partition` keep RLS off until the manual call.
 
 A good run prints one `NOTICE:  PASS ...` line per check and ends with:
 
@@ -94,7 +107,7 @@ NOTICE:  ALL CHECKS PASSED
 ROLLBACK
 ```
 
-If neither extension is available and not installed yet, h10 prints `NOTICE:  SKIP h10: ...` instead of a PASS, and the last line reads `NOTICE:  ALL CHECKS PASSED (1 skipped: h10)`. That is not a full pass: extension tables were not tested.
+If neither extension is available and not installed yet, or the one created ran its script as another role (the SKIP line names the table, its owner and the reason), h10 prints `NOTICE:  SKIP h10: ...` instead of a PASS, and the last line reads `NOTICE:  ALL CHECKS PASSED (1 skipped: h10)`. That is not a full pass: extension tables were not tested.
 
 A failing check stops with `ERROR:  FAIL <check>: <reason>`, and every later statement reports `current transaction is aborted` until the final `ROLLBACK`. Add `-v ON_ERROR_STOP=1` to make psql exit non-zero on failure. Any trigger you have on `auth.users` runs for the two test rows and is rolled back with them.
 
@@ -108,8 +121,7 @@ Screenshots of a verification run are in [`proofs/`](proofs/).
 - Tables that existed before the migration are not changed. Use the same call.
 - `alter table ... set schema public` does not fire the trigger, so a table moved into `public` keeps RLS off. Run the same call on it, or enable RLS and add policies on it yourself.
 - `alter table ... attach partition` does not fire the trigger, so an attached partition keeps RLS off, and a query on the partition itself does not apply the parent's policies. Run the same call on the partition, or enable RLS and add policies on it yourself. A partition created with `create table ... partition of` is covered.
-- Tables an extension script creates in `public` (`create extension` or `alter extension ... update`) get RLS on and no policies, with a `WARNING`. A function or query that reads one as an API role, such as a coordinate transform reading its reference table, needs a read policy you add yourself.
-- An extension that needs a superuser (for example `postgis`) may run its script as a superuser role. Where event triggers do not fire for superusers, the tables that script creates keep RLS off and get no warning; check them and enable RLS yourself if they are in an exposed schema.
+- Extension tables, as described under Usage: when the extension's script runs as the calling role (not a superuser), its tables in `public` get RLS on, no policies and a `WARNING`. When the script runs as a superuser, its tables are not touched and no message is shown, because event triggers do not fire for superusers; find them with the query under Usage and secure them yourself.
 - Table owners, roles with `BYPASSRLS` and `service_role` bypass RLS by design. On Supabase this includes `postgres`.
 - On hosted Supabase, event triggers do not fire for superuser or reserved roles (`supabase_admin`, `service_role`, `anon`, `authenticated` and others). Tables those roles create are not changed.
 - RLS is enabled, not forced, so the table owner is not restricted.

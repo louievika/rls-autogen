@@ -10,7 +10,8 @@
 --
 -- Each check raises NOTICE 'PASS: ...' or stops with ERROR 'FAIL: ...'. Check h10
 -- (extension tables) raises NOTICE 'SKIP h10: ...' instead when neither pg_partman
--- nor postgis is available and not installed yet.
+-- nor postgis is available and not installed yet, or when the one it creates ran
+-- its script as another role, such as a superuser (not a test of the trigger).
 -- The last line of a good run is NOTICE 'ALL CHECKS PASSED'. If a check was
 -- skipped it reads NOTICE 'ALL CHECKS PASSED (1 skipped: h10)', which is not a
 -- full pass: the skipped check was not tested.
@@ -515,15 +516,24 @@ $$;
 -- Tables an extension script creates in public get RLS and no policies. Takes the
 -- first of these extensions that is available and not installed yet (both create a
 -- table in the schema they are installed into), creates it in public and checks
--- every table it put there. Any error from create extension is a FAIL. A second
--- extension is only tried when the first put no table in public. Rolled back with
--- the rest. When none of them is available, prints SKIP h10 and the final line
--- reports the skip.
+-- every table it put there. Any error from create extension is a FAIL. Rolled back
+-- with the rest.
+-- Only a script that ran as the current role tests the trigger: event triggers do
+-- not fire while a superuser runs the statement, so a script run as a superuser
+-- leaves its tables alone by design. Who ran the script is read from the table
+-- owner, since create extension makes the role running the script the owner of
+-- what it creates. A table owned by another role, or a current role that is a
+-- superuser, is recorded as not a test of the trigger. The next extension is
+-- tried when the first tested no table. When none tested a table, prints SKIP h10
+-- with the reason and the final line reports the skip.
 do $$
 declare
-  v_ext    text;
-  v_t      regclass;
-  v_tested text[] := '{}';
+  v_ext      text;
+  v_t        regclass;
+  v_owner    oid;
+  v_me_super boolean := (select rolsuper from pg_catalog.pg_roles where rolname = current_user);
+  v_tested   text[] := '{}';
+  v_elevated text[] := '{}';
 begin
   foreach v_ext in array array['pg_partman', 'postgis'] loop
     continue when not exists (select 1 from pg_catalog.pg_available_extensions
@@ -533,8 +543,8 @@ begin
     exception when others then
       raise exception 'FAIL h10: create extension % raised an error: %', v_ext, sqlerrm;
     end;
-    for v_t in
-      select c.oid::regclass
+    for v_t, v_owner in
+      select c.oid::regclass, c.relowner
         from pg_catalog.pg_depend d
         join pg_catalog.pg_class c on c.oid = d.objid
         join pg_catalog.pg_extension e on e.oid = d.refobjid
@@ -546,6 +556,14 @@ begin
          and c.relkind in ('r', 'p')
        order by c.oid
     loop
+      if v_me_super or v_owner <> (select oid from pg_catalog.pg_roles where rolname = current_user) then
+        v_elevated := v_elevated || pg_catalog.format('%s (%s) is owned by %s%s, so its script did not run as %s',
+          v_t, v_ext, v_owner::regrole,
+          case when (select rolsuper from pg_catalog.pg_roles where oid = v_owner)
+               then ' (superuser; event triggers do not fire for superusers)' else '' end,
+          case when v_me_super then 'a non-superuser' else current_user::text end);
+        continue;
+      end if;
       if not (select relrowsecurity from pg_catalog.pg_class where oid = v_t) then
         raise exception 'FAIL h10: % (created by extension %) has no RLS', v_t, v_ext;
       end if;
@@ -559,7 +577,12 @@ begin
   if pg_catalog.cardinality(v_tested) = 0 then
     perform pg_catalog.set_config('verify.skipped',
       pg_catalog.concat_ws(',', nullif(pg_catalog.current_setting('verify.skipped', true), ''), 'h10'), true);
-    raise notice 'SKIP h10: none of pg_partman, postgis is available and not installed yet; extension tables not tested';
+    if pg_catalog.cardinality(v_elevated) > 0 then
+      raise notice 'SKIP h10: not a test of the trigger: %; no other candidate ran as the current role; extension tables not tested',
+        pg_catalog.array_to_string(v_elevated, '; ');
+    else
+      raise notice 'SKIP h10: none of pg_partman, postgis is available and not installed yet; extension tables not tested';
+    end if;
   else
     raise notice 'PASS h10: tables created by create extension get RLS and 0 policies: %',
       pg_catalog.array_to_string(v_tested, ', ');

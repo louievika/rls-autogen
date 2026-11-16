@@ -19,6 +19,8 @@
 --   (a NOTICE would be hidden, since Postgres shows only WARNING and above while
 --   an extension script runs).
 --   It is locked for anon and authenticated until you add a policy yourself.
+--   This needs the script to run as a role that is not a superuser; see Known
+--   limits.
 --
 -- Opt out for the tables created in one transaction
 --   set local maintenance.rls_autogen = 'off';
@@ -35,9 +37,17 @@
 --     the parent's policies. Run the same call on the partition, or enable RLS and
 --     add policies on it yourself. A partition created with CREATE TABLE ...
 --     PARTITION OF is covered.
---   - Extension tables get RLS and no policies. A function or query that reads one
---     as an API role (for example a coordinate transform reading its reference
---     table) gets no rows until you add a read policy for that role.
+--   - Extension tables. When the extension's script runs as the calling role (not
+--     a superuser), its tables in public get RLS on, no policies and a WARNING. A
+--     function or query that reads one as an API role (for example a coordinate
+--     transform reading its reference table) gets no rows until you add a read
+--     policy for that role. When the script runs as a superuser, its tables are
+--     NOT touched and no message is shown, because event triggers do not fire for
+--     superusers. Check such tables and secure them yourself. To list the tables
+--     in public with RLS off:
+--       select c.oid::regclass from pg_catalog.pg_class c
+--        where c.relnamespace = 'public'::regnamespace
+--          and c.relkind in ('r', 'p') and not c.relrowsecurity;
 --   - Table owners, roles with BYPASSRLS and service_role bypass RLS by design.
 --   - On hosted Supabase, event triggers do not fire for superuser or reserved
 --     roles (supabase_admin, service_role, anon, authenticated and others).

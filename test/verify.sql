@@ -9,9 +9,10 @@
 --
 -- Everything runs in one transaction that ends in ROLLBACK, so nothing is left behind.
 -- It creates tables and domains named public.demo_*, the schemas demo_other_schema
--- and demo_staging, a temporary table and two temporary functions, two throwaway
--- rows in auth.users with random ids, and the first of the extensions pg_partman
--- and postgis that is available and not installed yet (check h10).
+-- and demo_staging, the role demo_role (check j), a temporary table and two
+-- temporary functions, two throwaway rows in auth.users with random ids, and the
+-- first of the extensions pg_partman and postgis that is available and not
+-- installed yet and can be created (check h10).
 -- Any trigger you have on auth.users runs for those two rows (and is rolled back with them).
 -- Run it with a search_path that does not include auth (for example
 -- PGOPTIONS='-c search_path=public'): check b reads the policies back as text,
@@ -22,14 +23,17 @@
 --   FAIL <check>: ...   (ERROR; the transaction is aborted)
 --   SKIP <check>: ...   (NOTICE)
 -- Check h10 (extension tables) prints SKIP h10 instead of PASS when neither pg_partman
--- nor postgis is available and not installed yet, or when each one it creates ran
--- its script as another role for whom the trigger did not fire (not a test of
--- the trigger).
+-- nor postgis is available, not installed yet and can be created, or when each one
+-- it creates ran its script as another role for whom the trigger did not fire
+-- (not a test of the trigger). Check j2 prints SKIP j2 when this role cannot
+-- grant authenticated to demo_role (its way to usage on schema auth).
 -- The last line of a good run is NOTICE 'ALL CHECKS PASSED'. If a check was
 -- skipped it reads NOTICE 'ALL CHECKS PASSED (1 skipped: h10)', which is not a
 -- full pass: the skipped check was not tested.
 -- Checks g, g2, h6 and h11 switch the trigger off on purpose, so each table they skip
--- prints WARNING 'rls_autogen: RLS was NOT enabled on ...'. That is expected.
+-- prints WARNING 'rls_autogen: RLS was NOT enabled on ...'. Check j prints
+-- WARNING 'rls_autogen: ... has owner column ..., but ...' for demo_role's tables.
+-- Both are expected.
 
 begin;
 
@@ -588,8 +592,9 @@ $$;
 -- Tables an extension script creates in public get RLS and no policies. Takes the
 -- first of these extensions that is available and not installed yet (both create a
 -- table in the schema they are installed into), creates it in public and checks
--- every table it put there. Any error from create extension is a FAIL. Rolled back
--- with the rest.
+-- every table it put there. An error raised by the trigger during create extension
+-- is a FAIL; any other error (a missing dependency, for example) marks that
+-- extension unusable and the next one is tried. Rolled back with the rest.
 -- Each table is judged by what happened to it, not by who the caller is. A probe
 -- table first shows the trigger fires for current_user (check 0 and the checks
 -- above already depend on that). Who ran the script is read from the table owner,
@@ -597,7 +602,10 @@ $$;
 -- creates.
 --   RLS on, no policies           -> tested, passes, whoever owns it.
 --   any policy                    -> FAIL.
---   RLS off, owned by current_user -> FAIL: the trigger fires for that role.
+--   RLS off, owned by current_user -> FAIL: the trigger fires for that role (a
+--                                     platform that reassigns ownership of
+--                                     extension tables after creating them gives
+--                                     this result too).
 --   RLS off, owned by another role -> not a test: the script ran as that role and
 --                                     the trigger did not fire for it (some managed
 --                                     platforms skip event triggers for superuser
@@ -613,6 +621,8 @@ declare
   v_me     oid := (select oid from pg_catalog.pg_roles where rolname = current_user);
   v_tested text[] := '{}';
   v_other  text[] := '{}';
+  v_msg    text;
+  v_ctx    text;
 begin
   create table public.demo_h10_probe (id int);
   if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_h10_probe'::regclass) then
@@ -626,7 +636,12 @@ begin
     begin
       execute pg_catalog.format('create extension %I schema public', v_ext);
     exception when others then
-      raise exception 'FAIL h10: create extension % raised an error: %', v_ext, sqlerrm;
+      get stacked diagnostics v_msg = message_text, v_ctx = pg_exception_context;
+      if v_msg like 'rls_autogen:%' or v_ctx like '%function maintenance.%' then
+        raise exception 'FAIL h10: the trigger raised an error during create extension %: %', v_ext, v_msg;
+      end if;
+      v_other := v_other || pg_catalog.format('%s could not be created (%s), so it was not used', v_ext, v_msg);
+      continue;
     end;
     for v_t, v_owner, v_rls in
       select c.oid::regclass, c.relowner, c.relrowsecurity
@@ -646,7 +661,7 @@ begin
       elsif v_rls then
         v_tested := v_tested || pg_catalog.format('%s (%s, created as %s)', v_t, v_ext, v_owner::regrole);
       elsif v_owner = v_me then
-        raise exception 'FAIL h10: % (created by extension % as %, for whom the trigger fires) has no RLS',
+        raise exception 'FAIL h10: % (created by extension %, owned by %, for whom the trigger fires) has no RLS. A platform that reassigns ownership of extension tables after creating them gives this result too.',
           v_t, v_ext, v_owner::regrole;
       else
         v_other := v_other || pg_catalog.format('%s (%s) was created as role %s, for whom the trigger did not fire',
@@ -659,7 +674,7 @@ begin
     perform pg_catalog.set_config('verify.skipped',
       pg_catalog.concat_ws(',', nullif(pg_catalog.current_setting('verify.skipped', true), ''), 'h10'), true);
     if pg_catalog.cardinality(v_other) > 0 then
-      raise notice 'SKIP h10: not a test of the trigger: %; no other candidate tested a table; extension tables not tested',
+      raise notice 'SKIP h10: no candidate tested a table: %; extension tables not tested',
         pg_catalog.array_to_string(v_other, '; ');
     else
       raise notice 'SKIP h10: none of pg_partman, postgis is available and not installed yet; extension tables not tested';
@@ -668,7 +683,7 @@ begin
     raise notice 'PASS h10: tables created by create extension get RLS and 0 policies: %',
       pg_catalog.array_to_string(v_tested, ', ')
       || case when pg_catalog.cardinality(v_other) > 0
-              then '; not a test of the trigger: ' || pg_catalog.array_to_string(v_other, '; ') else '' end;
+              then '; not tested: ' || pg_catalog.array_to_string(v_other, '; ') else '' end;
   end if;
 end;
 $$;
@@ -934,6 +949,85 @@ begin
       pg_temp.policy_list('public.demo_domain_name');
   end if;
   raise notice 'PASS i7: domain over uuid named user_id without a foreign key -> RLS and 4 policies on user_id';
+end;
+$$;
+
+-- j. A role other than postgres that creates and owns tables in public, with the two
+-- grants the README documents for it and no usage on schema auth.
+create role demo_role nologin;
+grant demo_role to current_user;
+grant usage, create on schema public to demo_role;
+grant usage on schema maintenance to demo_role;
+grant execute on function maintenance.apply_owner_policies(regclass) to demo_role;
+
+-- j1. Its create table never fails because auth is out of reach, and never leaves the
+-- table open: RLS on and no policies, with or without an owner column.
+do $$
+declare
+  v_t regclass;
+begin
+  if pg_catalog.has_schema_privilege('demo_role', 'auth', 'USAGE') then
+    raise exception 'FAIL j1: setup: demo_role already has usage on schema auth, so a role without it cannot be tested';
+  end if;
+  perform pg_catalog.set_config('role', 'demo_role', true);
+  begin
+    create table public.demo_role_plain (id int);
+    create table public.demo_role_owned (id uuid primary key, user_id uuid);
+  exception when others then
+    raise exception 'FAIL j1: create table as demo_role (no usage on schema auth) raised an error: %', sqlerrm;
+  end;
+  reset role;
+  foreach v_t in array array['public.demo_role_plain', 'public.demo_role_owned']::regclass[] loop
+    if not (select relrowsecurity from pg_catalog.pg_class where oid = v_t and relowner = 'demo_role'::regrole)
+       or pg_temp.policy_list(v_t) <> '' then
+      raise exception 'FAIL j1: % (created by demo_role) should have RLS on and no policies (got %)', v_t, pg_temp.policy_list(v_t);
+    end if;
+  end loop;
+  raise notice 'PASS j1: demo_role without usage on schema auth creates tables without error; with and without an owner column -> RLS on, 0 policies';
+end;
+$$;
+
+-- j2. The manual call by that owner works with the two grants. Without usage on
+-- schema auth it enables RLS and adds no policies; with it, the four policies.
+set local maintenance.rls_autogen = 'off';
+set local role demo_role;
+create table public.demo_role_manual (id uuid primary key, user_id uuid);
+reset role;
+set local maintenance.rls_autogen = 'on';
+
+do $$
+declare
+  v_t regclass := 'public.demo_role_manual';
+begin
+  if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) then
+    raise exception 'FAIL j2: setup: % has RLS although the trigger was switched off', v_t;
+  end if;
+  perform pg_catalog.set_config('role', 'demo_role', true);
+  perform maintenance.apply_owner_policies(v_t);
+  reset role;
+  if not (select relrowsecurity from pg_catalog.pg_class where oid = v_t) or pg_temp.policy_list(v_t) <> '' then
+    raise exception 'FAIL j2: manual call by demo_role without usage on schema auth should give RLS on and no policies (got %)',
+      pg_temp.policy_list(v_t);
+  end if;
+
+  -- Usage on schema auth through membership in authenticated, which has it on Supabase.
+  begin
+    grant authenticated to demo_role;
+  exception when insufficient_privilege then null;
+  end;
+  if not pg_catalog.has_schema_privilege('demo_role', 'auth', 'USAGE') then
+    perform pg_catalog.set_config('verify.skipped',
+      pg_catalog.concat_ws(',', nullif(pg_catalog.current_setting('verify.skipped', true), ''), 'j2'), true);
+    raise notice 'SKIP j2: manual call by demo_role with the two grants -> RLS on, 0 policies; % cannot give demo_role usage on schema auth (grant authenticated to demo_role), so the call with policies was not tested', current_user;
+    return;
+  end if;
+  perform pg_catalog.set_config('role', 'demo_role', true);
+  perform maintenance.apply_owner_policies(v_t);
+  reset role;
+  if pg_temp.policy_list(v_t) <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update' then
+    raise exception 'FAIL j2: manual call by demo_role with usage on schema auth did not add 4 policies (got %)', pg_temp.policy_list(v_t);
+  end if;
+  raise notice 'PASS j2: manual call by demo_role (owner, not postgres) with the two grants -> RLS on, 0 policies without usage on schema auth; 4 policies with it';
 end;
 $$;
 

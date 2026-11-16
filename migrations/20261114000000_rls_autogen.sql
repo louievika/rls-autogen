@@ -15,7 +15,9 @@
 --   foreign key at all is the owner by its name. A domain over uuid counts as
 --   uuid. With no owner column, or without auth.users, the table gets RLS and no
 --   policies, so it is deny-all for anon and authenticated. A notice says which
---   case applied.
+--   case applied. When the table has an owner column but auth.uid() or the role
+--   authenticated is missing, or the caller has no usage on schema auth, it gets
+--   RLS and no policies, and a WARNING names the table and the reason.
 --   A table created by an extension script gets RLS and no policies, and a
 --   WARNING, when the trigger fires for the role that runs the script.
 --   Existing policies with these names are kept. Grants are not changed.
@@ -23,9 +25,10 @@
 --     select maintenance.apply_owner_policies('public.demo_posts');
 --
 -- Install
---   Needs the roles anon, authenticated and postgres. Uses auth.users and
---   auth.uid(). Creates the schema maintenance, or reuses an existing one, and
---   revokes all access to it from public, anon and authenticated. Safe to run
+--   Expects the roles anon, authenticated and postgres; the revoke or grant for
+--   a missing one is skipped with a notice. Creates the schema maintenance, or
+--   reuses an existing one, and revokes all access to it from public, anon and
+--   authenticated. Safe to run
 --   again; run it in one transaction (psql -1) so that the event trigger is not
 --   missing between its drop and its create.
 --
@@ -46,12 +49,12 @@
 --   - Restoring a dump with the trigger enabled adds policies, causes duplicate
 --     policy errors and locks tables. Disable the trigger for the restore.
 --   - Table owners, roles with BYPASSRLS and service_role bypass RLS.
---   - On hosted Supabase, event triggers do not fire for superuser or reserved
---     roles (supabase_admin, service_role, anon, authenticated and others).
---     Tables they create, including extension tables, keep RLS off.
+--   - On hosted platforms such as Supabase, the trigger may not fire for
+--     superuser or reserved roles. Tables it does not see, including extension
+--     tables, keep RLS off; list them with the RLS-off query in README.md.
 
 create schema if not exists maintenance;
-revoke all on schema maintenance from public, anon, authenticated;
+revoke all on schema maintenance from public;
 
 -- Enable RLS on one table and add the owner policies when an owner column is found.
 -- Runs as the caller, who must own the table.
@@ -62,13 +65,15 @@ security invoker
 set search_path = ''
 as $$
 declare
-  v_users regclass := pg_catalog.to_regclass('auth.users');
   v_kind  "char";
+  v_auth  oid;
+  v_users oid;
   v_uuid  name[];
   v_cols  name[];
   v_owner name;
   v_refs  text;
   v_pred  text;
+  v_why   text[] := '{}';
 begin
   select c.relkind into v_kind from pg_catalog.pg_class c where c.oid = p_table;
   if v_kind is null or v_kind not in ('r', 'p') then
@@ -78,6 +83,10 @@ begin
 
   execute pg_catalog.format('alter table %s enable row level security', p_table);
 
+  -- Catalog reads only: to_regclass('auth.users') raises an error for a caller
+  -- without usage on schema auth.
+  select n.oid into v_auth from pg_catalog.pg_namespace n where n.nspname = 'auth';
+  select c.oid into v_users from pg_catalog.pg_class c where c.relnamespace = v_auth and c.relname = 'users';
   if v_users is null then
     raise notice 'rls_autogen: auth.users does not exist, so % cannot have an owner column; RLS is on, no policies created. Add policies yourself.', p_table;
     return;
@@ -145,6 +154,24 @@ begin
     return;
   end if;
 
+  -- The policies need these. Without them the table stays locked: RLS on, no policies.
+  if not pg_catalog.has_schema_privilege(v_auth, 'USAGE') then
+    v_why := v_why || pg_catalog.format('role %I has no usage on schema auth', current_user);
+  end if;
+  if not exists (select 1 from pg_catalog.pg_proc p
+                  where p.pronamespace = v_auth and p.proname = 'uid' and p.pronargs = 0
+                    and p.prorettype = 'pg_catalog.uuid'::pg_catalog.regtype) then
+    v_why := v_why || 'function auth.uid() returning uuid does not exist'::text;
+  end if;
+  if not exists (select 1 from pg_catalog.pg_roles r where r.rolname = 'authenticated') then
+    v_why := v_why || 'role authenticated does not exist'::text;
+  end if;
+  if pg_catalog.cardinality(v_why) > 0 then
+    raise warning 'rls_autogen: % has owner column %, but %; RLS is on, no policies created. Add policies yourself.',
+      p_table, v_owner, pg_catalog.array_to_string(v_why, ', and ');
+    return;
+  end if;
+
   v_pred := pg_catalog.format('(select auth.uid()) = %I', v_owner);
 
   if not exists (select 1 from pg_catalog.pg_policy p where p.polrelid = p_table and p.polname = 'owner_select') then
@@ -193,12 +220,9 @@ begin
       null;
     end;
     if pg_catalog.lower(pg_catalog.btrim(v_reset)) in ('off', 'false', '0') then
-      v_skip := pg_catalog.format(
-        'It is set beyond this transaction (for the role, the database, the connection options or the server configuration), '
-        'so every later table on this connection is skipped too. reset maintenance.rls_autogen does not clear it; '
-        'run alter role %I reset maintenance.rls_autogen or alter database %I reset maintenance.rls_autogen '
-        '(or remove it from the connection options or server configuration), then reconnect.',
-        session_user, pg_catalog.current_database());
+      v_skip := 'It is stored outside this session (for a role, a database, the connection options or the server '
+                'configuration), so every later table on this connection is skipped too. The "Opt out" section of '
+                'README.md lists how to find and clear it.';
     else
       v_skip := 'Only set local inside a transaction is supported; a plain set keeps it off for every later table '
                 'on this connection until reset maintenance.rls_autogen.';
@@ -245,20 +269,40 @@ begin
     exception when insufficient_privilege then
       raise exception 'rls_autogen: could not secure %: %', v_oid::pg_catalog.regclass, sqlerrm
         using errcode = 'insufficient_privilege',
-              hint = 'Grant usage on schema maintenance and execute on maintenance.apply_owner_policies(regclass) '
-                     'to this role, or run set local maintenance.rls_autogen = ''off'' first.';
+              hint = 'Possible causes: this role does not own the table; or it lacks usage on schema maintenance '
+                     'or execute on maintenance.apply_owner_policies(regclass).';
     end;
   end loop;
 end;
 $$;
 
-revoke all on function maintenance.apply_owner_policies(regclass) from public, anon, authenticated;
-revoke all on function maintenance.rls_autogen() from public, anon, authenticated;
+revoke all on function maintenance.apply_owner_policies(regclass) from public;
+revoke all on function maintenance.rls_autogen() from public;
 
--- The trigger runs as the role that creates the table. On Supabase that is postgres.
-grant usage on schema maintenance to postgres;
-grant execute on function maintenance.apply_owner_policies(regclass) to postgres;
-grant execute on function maintenance.rls_autogen() to postgres;
+-- Revokes for anon and authenticated, and grants to postgres, for the roles that exist.
+-- The trigger runs as the role that creates the table, and calls apply_owner_policies
+-- as that role. On Supabase that is postgres. The event trigger itself needs no grant.
+do $$
+declare
+  v_role name;
+begin
+  foreach v_role in array array['anon', 'authenticated'] loop
+    if exists (select 1 from pg_catalog.pg_roles where rolname = v_role) then
+      execute pg_catalog.format('revoke all on schema maintenance from %I', v_role);
+      execute pg_catalog.format('revoke all on function maintenance.apply_owner_policies(regclass) from %I', v_role);
+      execute pg_catalog.format('revoke all on function maintenance.rls_autogen() from %I', v_role);
+    else
+      raise notice 'rls_autogen: role % does not exist; its revoke was skipped', v_role;
+    end if;
+  end loop;
+  if exists (select 1 from pg_catalog.pg_roles where rolname = 'postgres') then
+    grant usage on schema maintenance to postgres;
+    grant execute on function maintenance.apply_owner_policies(regclass) to postgres;
+  else
+    raise notice 'rls_autogen: role postgres does not exist; its grant was skipped';
+  end if;
+end;
+$$;
 
 drop event trigger if exists rls_autogen;
 create event trigger rls_autogen on ddl_command_end

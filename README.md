@@ -1,6 +1,6 @@
 # rls-autogen
 
-One Postgres migration that turns on row level security for every new table in a Supabase project's `public` schema and adds owner-only policies when the table has an owner column.
+One Postgres migration that turns on row level security for tables created in a Supabase project's `public` schema with `create table`, `create table ... as` and `select ... into`, and adds owner-only policies when the table has an owner column. Ways a table can reach `public` without it are listed under [Limits and security notes](#limits-and-security-notes).
 
 ## Problem
 
@@ -213,7 +213,7 @@ None of these is a full pass: a skipped check was not tested (h10: extension tab
 
 A failing check stops with `ERROR:  FAIL <check>: <reason>`, and every later statement reports `current transaction is aborted` until the final `ROLLBACK`. Add `-v ON_ERROR_STOP=1` to make psql exit non-zero on failure. Any trigger you have on `auth.users` runs for the two test rows and is rolled back with them.
 
-Verification performed on an isolated Supabase project with disposable credentials. Results reproducible with the included test script.
+Verification performed on a local Supabase stack with disposable credentials. It has not been run on a hosted project. Results reproducible with the included test script.
 
 Screenshots of an install and a self-check run are in [`proofs/`](proofs/). In that run check h12 is skipped, because the role used may not set `session_replication_role` there. The replica-mode check passed on a separate database where the role may set it.
 

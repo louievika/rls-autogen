@@ -11,7 +11,7 @@
 -- It creates tables and domains named public.demo_*, two more tables in public
 -- with quoted names (public."Demo Table" and the injection test table
 -- public."demo_x""); drop table public.demo_posts; --"), the schemas
--- demo_other_schema and demo_staging, the role demo_role (check j), a temporary
+-- demo_other_schema and demo_staging, the role demo_role (checks j0 to j2), a temporary
 -- table and two temporary functions, two throwaway rows in auth.users with random
 -- ids, and the first of the extensions pg_partman and postgis that is available
 -- and not installed yet and can be created (check h10).
@@ -27,14 +27,21 @@
 -- it creates ran its script as another role for whom the trigger did not fire
 -- (not a test of the trigger). Check j2 prints SKIP j2 when this role cannot
 -- grant authenticated to demo_role (its way to usage on schema auth).
--- The last line of a good run is NOTICE 'ALL CHECKS PASSED'. If a check was
--- skipped it reads NOTICE 'ALL CHECKS PASSED (1 skipped: h10)', which is not a
--- full pass: the skipped check was not tested.
+-- h10 and j2 are the only checks that can print SKIP. The last line of a good run
+-- is one of:
+--   NOTICE 'ALL CHECKS PASSED'
+--   NOTICE 'ALL CHECKS PASSED (1 skipped: h10)'
+--   NOTICE 'ALL CHECKS PASSED (1 skipped: j2)'
+--   NOTICE 'ALL CHECKS PASSED (2 skipped: h10, j2)'
+-- Only the first is a full pass; a skipped check was not tested.
 -- Checks g, h6, h11 and j2 opt out on purpose, so each table they skip prints
 -- WARNING 'rls_autogen: RLS is not enabled on ...'. Check g2 sets values that must
 -- be ignored, so each of its statements prints WARNING 'rls_autogen: ignored
--- maintenance.rls_autogen = ...'. Check j prints WARNING 'rls_autogen: ... has
--- owner column ..., but ...' for demo_role's tables. All are expected.
+-- maintenance.rls_autogen = ...'. Check j0 prints WARNING 'rls_autogen: ... is
+-- locked (RLS on, no policies): owner policies were not added because role
+-- demo_role lacks ...' for its two tables. Checks j1 and j2 print WARNING
+-- 'rls_autogen: ... has owner column ..., but ...' for demo_role's tables. All
+-- are expected.
 -- The opt-out across transactions and in autocommit mode cannot be shown inside
 -- this file's single transaction; check g2 uses a token with another transaction
 -- id instead.
@@ -98,7 +105,7 @@ begin
   end;
   select relrowsecurity into v_rls from pg_catalog.pg_class where oid = 'public.demo_probe_0'::regclass;
   drop table public.demo_probe_0;
-  if not v_rls then
+  if v_rls is not true then
     raise exception 'FAIL 0: the trigger did not fire for a table created by role % (superuser: %, maintenance.rls_autogen: %). Some managed platforms skip event triggers for superuser or reserved roles; run this file as a role the trigger fires for, such as the role that creates your tables.',
       current_user,
       (select rolsuper from pg_catalog.pg_roles where rolname = current_user),
@@ -150,7 +157,7 @@ begin
   select count(*) into v_bad
     from pg_catalog.pg_policy p
    where p.polrelid = 'public.demo_posts'::regclass
-     and not (p.polpermissive
+     and (p.polpermissive
               and p.polroles = array['authenticated'::regrole::oid]
               and case p.polcmd
                     when 'r' then p.polwithcheck is null and pg_catalog.pg_get_expr(p.polqual, p.polrelid) like '%auth.uid()%= user_id)'
@@ -158,7 +165,7 @@ begin
                     when 'a' then p.polqual is null and pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid) like '%auth.uid()%= user_id)'
                     when 'w' then pg_catalog.pg_get_expr(p.polqual, p.polrelid) like '%auth.uid()%= user_id)'
                               and pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid) like '%auth.uid()%= user_id)'
-                  end);
+                  end) is not true;
   if v_bad <> 0 then
     raise exception 'FAIL b: % policies have the wrong role, type or predicate', v_bad;
   end if;
@@ -174,6 +181,7 @@ declare
   v_n      bigint;
 begin
   select pg_catalog.md5(pg_catalog.string_agg(t::text, ',' order by t.id)) into v_before from public.demo_posts t;
+  if v_before is null then raise exception 'FAIL c: setup: public.demo_posts has no rows'; end if;
   perform pg_temp.act_as('anon');
 
   select count(*) into v_n from public.demo_posts;
@@ -249,6 +257,9 @@ declare
 begin
   select id, pg_catalog.md5(t::text) into v_a_row, v_before from public.demo_posts t where body = 'a-seed';
   select id into v_b_row from public.demo_posts where body = 'b-seed';
+  if v_a_row is null or v_b_row is null then
+    raise exception 'FAIL e: setup: the seed rows of user A or user B are missing';
+  end if;
   perform pg_temp.act_as('authenticated', v_b::text);
 
   select count(*) into v_n from public.demo_posts where id = v_a_row or user_id = v_a;
@@ -293,7 +304,8 @@ declare
   v_before text;
 begin
   select pg_catalog.md5(pg_catalog.string_agg(t::text, ',' order by t.id)) into v_before from public.demo_notes t;
-  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_notes'::regclass) then
+  if v_before is null then raise exception 'FAIL f: setup: public.demo_notes has no rows'; end if;
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_notes'::regclass) is not true then
     raise exception 'FAIL f: RLS is not enabled on public.demo_notes';
   end if;
   if pg_temp.policy_list('public.demo_notes') <> '' then
@@ -329,7 +341,7 @@ $$;
 -- back to a savepoint taken after the call. Called inside a savepoint that is rolled
 -- back, the call is undone; inside one that is released, it stays. Cleared with
 -- set local maintenance.rls_autogen = '' before going on.
-select maintenance.skip_rls_autogen();
+do $$ begin perform maintenance.skip_rls_autogen(); end $$;
 create table public.demo_optout (id uuid primary key, user_id uuid references auth.users (id));
 savepoint demo_sp1;
 create table public.demo_optout_sp (id uuid primary key, user_id uuid references auth.users (id));
@@ -341,7 +353,7 @@ begin
     raise exception 'FAIL g: inside a savepoint the value is % and not the top-level token',
       pg_catalog.current_setting('maintenance.rls_autogen', true);
   end if;
-  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_optout_sp'::regclass)
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_optout_sp'::regclass) is not false
      or pg_temp.policy_list('public.demo_optout_sp') <> '' then
     raise exception 'FAIL g: a table created inside a savepoint after the call got RLS or policies';
   end if;
@@ -352,11 +364,11 @@ rollback to savepoint demo_sp1;
 create table public.demo_optout_after_sp (id uuid primary key, user_id uuid references auth.users (id));
 set local maintenance.rls_autogen = '';
 savepoint demo_sp2;
-select maintenance.skip_rls_autogen();
+do $$ begin perform maintenance.skip_rls_autogen(); end $$;
 rollback to savepoint demo_sp2;
 create table public.demo_optin_sp_undone (id uuid primary key, user_id uuid references auth.users (id));
 savepoint demo_sp3;
-select maintenance.skip_rls_autogen();
+do $$ begin perform maintenance.skip_rls_autogen(); end $$;
 release savepoint demo_sp3;
 create table public.demo_optout_released (id uuid primary key, user_id uuid references auth.users (id));
 set local maintenance.rls_autogen = '';
@@ -367,12 +379,12 @@ declare
   v_t regclass;
 begin
   foreach v_t in array array['public.demo_optout', 'public.demo_optout_after_sp', 'public.demo_optout_released']::regclass[] loop
-    if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) or pg_temp.policy_list(v_t) <> '' then
+    if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) is not false or pg_temp.policy_list(v_t) <> '' then
       raise exception 'FAIL g: % got RLS or policies although maintenance.skip_rls_autogen() was called', v_t;
     end if;
   end loop;
   foreach v_t in array array['public.demo_optin_sp_undone', 'public.demo_optin']::regclass[] loop
-    if not (select relrowsecurity from pg_catalog.pg_class where oid = v_t)
+    if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) is not true
        or pg_temp.policy_list(v_t) <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update' then
       raise exception 'FAIL g: % should have RLS and 4 policies (got %)', v_t, pg_temp.policy_list(v_t);
     end if;
@@ -412,7 +424,7 @@ begin
   end if;
   foreach v_t in array array['public.demo_ignored_stale', 'public.demo_ignored_off', 'public.demo_ignored_false',
                              'public.demo_ignored_zero', 'public.demo_ignored_session']::regclass[] loop
-    if not (select relrowsecurity from pg_catalog.pg_class where oid = v_t)
+    if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) is not true
        or pg_temp.policy_list(v_t) <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update' then
       raise exception 'FAIL g2: % should have RLS and 4 policies, the value was not this transaction''s token (got %)',
         v_t, pg_temp.policy_list(v_t);
@@ -446,7 +458,7 @@ begin
   if pg_temp.policy_list('public.demo_two_owners') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
      or exists (select 1 from pg_catalog.pg_policy p
                  where p.polrelid = 'public.demo_two_owners'::regclass
-                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid))
+                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid), '')
                        not like '%= user_id)') then
     raise exception 'FAIL h1: user_id was not chosen on demo_two_owners';
   end if;
@@ -455,13 +467,13 @@ begin
   if pg_temp.policy_list('public.demo_owner_pref') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
      or exists (select 1 from pg_catalog.pg_policy p
                  where p.polrelid = 'public.demo_owner_pref'::regclass
-                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid))
+                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid), '')
                        not like '%= owner_id)') then
     raise exception 'FAIL h2: owner_id was not chosen on demo_owner_pref';
   end if;
   raise notice 'PASS h2: two owner candidates (owner_id, editor_id) -> policies on owner_id';
 
-  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_ambiguous'::regclass)
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_ambiguous'::regclass) is not true
      or pg_temp.policy_list('public.demo_ambiguous') <> '' then
     raise exception 'FAIL h3: ambiguous owner should give RLS on and no policies';
   end if;
@@ -488,7 +500,7 @@ declare
   v_n bigint;
 begin
   if pg_temp.policy_list('public."Demo Table"') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
-     or not (select relrowsecurity from pg_catalog.pg_class where oid = 'public."Demo Table"'::regclass) then
+     or (select relrowsecurity from pg_catalog.pg_class where oid = 'public."Demo Table"'::regclass) is not true then
     raise exception 'FAIL h4: "Demo Table" not secured';
   end if;
   if pg_temp.policy_list('public."demo_x""); drop table public.demo_posts; --"') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
@@ -523,6 +535,9 @@ begin
   perform maintenance.apply_owner_policies('public.demo_posts');
   perform maintenance.apply_owner_policies('public.demo_posts');
   select pg_catalog.array_agg(oid order by oid) into v_after from pg_catalog.pg_policy where polrelid = 'public.demo_posts'::regclass;
+  if pg_catalog.cardinality(v_before) is distinct from 4 then
+    raise exception 'FAIL h5: setup: public.demo_posts has % policies, expected 4', coalesce(pg_catalog.cardinality(v_before), 0);
+  end if;
   if v_after is distinct from v_before then
     raise exception 'FAIL h5: re-run changed policies';
   end if;
@@ -532,7 +547,7 @@ $$;
 
 -- A policy someone already wrote under one of the fixed names is kept. Also covers the
 -- manual call for a table the trigger did not handle.
-select maintenance.skip_rls_autogen();
+do $$ begin perform maintenance.skip_rls_autogen(); end $$;
 create table public.demo_custom (
   id      uuid primary key default gen_random_uuid(),
   user_id uuid references auth.users (id)
@@ -554,7 +569,7 @@ begin
     raise exception 'FAIL h6: existing owner_select policy was replaced';
   end if;
   if pg_temp.policy_list('public.demo_custom') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
-     or not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_custom'::regclass) then
+     or (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_custom'::regclass) is not true then
     raise exception 'FAIL h6: manual call did not secure demo_custom';
   end if;
   raise notice 'PASS h6: existing owner_select (using %) kept; manual call added the other 3 and RLS', v_qual;
@@ -567,10 +582,10 @@ select 1 as n into public.demo_select_into;
 
 do $$
 begin
-  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_ctas'::regclass) then
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_ctas'::regclass) is not true then
     raise exception 'FAIL h7: CREATE TABLE AS table has no RLS';
   end if;
-  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_select_into'::regclass) then
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_select_into'::regclass) is not true then
     raise exception 'FAIL h7: SELECT INTO table has no RLS';
   end if;
   raise notice 'PASS h7: CREATE TABLE AS and SELECT INTO tables get RLS';
@@ -594,9 +609,9 @@ declare
   v_b uuid := current_setting('verify.user_b')::uuid;
   v_n bigint;
 begin
-  if (select relkind from pg_catalog.pg_class where oid = 'public.demo_parted'::regclass) <> 'p'
-     or not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_parted'::regclass)
-     or not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_parted_2026'::regclass) then
+  if (select relkind from pg_catalog.pg_class where oid = 'public.demo_parted'::regclass) is distinct from 'p'
+     or (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_parted'::regclass) is not true
+     or (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_parted_2026'::regclass) is not true then
     raise exception 'FAIL h8: partitioned table or partition has no RLS';
   end if;
   if pg_temp.policy_list('public.demo_parted') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
@@ -625,11 +640,11 @@ create temporary table demo_temp (id uuid primary key);
 
 do $$
 begin
-  if (select relrowsecurity from pg_catalog.pg_class where oid = 'demo_other_schema.demo_t'::regclass)
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'demo_other_schema.demo_t'::regclass) is not false
      or pg_temp.policy_list('demo_other_schema.demo_t') <> '' then
     raise exception 'FAIL h9: table outside public was changed';
   end if;
-  if (select relrowsecurity from pg_catalog.pg_class where oid = 'pg_temp.demo_temp'::regclass) then
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'pg_temp.demo_temp'::regclass) is not false then
     raise exception 'FAIL h9: temporary table was changed';
   end if;
   raise notice 'PASS h9: tables in other schemas and temporary tables are left alone';
@@ -672,7 +687,7 @@ declare
   v_ctx    text;
 begin
   create table public.demo_h10_probe (id int);
-  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_h10_probe'::regclass) then
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_h10_probe'::regclass) is not true then
     raise exception 'FAIL h10: the trigger did not fire for a probe table created by %', current_user;
   end if;
   drop table public.demo_h10_probe;
@@ -684,7 +699,7 @@ begin
       execute pg_catalog.format('create extension %I schema public', v_ext);
     exception when others then
       get stacked diagnostics v_msg = message_text, v_ctx = pg_exception_context;
-      if v_msg like 'rls_autogen:%' or v_ctx like '%function maintenance.%' then
+      if coalesce(v_msg, '') like 'rls_autogen:%' or coalesce(v_ctx, '') like '%function maintenance.%' then
         raise exception 'FAIL h10: the trigger raised an error during create extension %: %', v_ext, v_msg;
       end if;
       v_other := v_other || pg_catalog.format('%s could not be created (%s), so it was not used', v_ext, v_msg);
@@ -746,7 +761,7 @@ create table demo_staging.demo_moved (
   user_id uuid references auth.users (id)
 );
 alter table demo_staging.demo_moved set schema public;
-select maintenance.skip_rls_autogen();
+do $$ begin perform maintenance.skip_rls_autogen(); end $$;
 create table public.demo_parted_2027 (like public.demo_parted including defaults);
 set local maintenance.rls_autogen = '';
 alter table public.demo_parted attach partition public.demo_parted_2027
@@ -759,11 +774,11 @@ declare
   v_b uuid := current_setting('verify.user_b')::uuid;
   v_n bigint;
 begin
-  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_moved'::regclass)
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_moved'::regclass) is not false
      or pg_temp.policy_list('public.demo_moved') <> '' then
     raise exception 'FAIL h11: table moved into public with set schema was changed; update the documented limit';
   end if;
-  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_parted_2027'::regclass)
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_parted_2027'::regclass) is not false
      or pg_temp.policy_list('public.demo_parted_2027') <> '' then
     raise exception 'FAIL h11: partition attached with attach partition was changed; update the documented limit';
   end if;
@@ -779,9 +794,9 @@ begin
 
   perform maintenance.apply_owner_policies('public.demo_moved');
   perform maintenance.apply_owner_policies('public.demo_parted_2027');
-  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_moved'::regclass)
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_moved'::regclass) is not true
      or pg_temp.policy_list('public.demo_moved') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
-     or not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_parted_2027'::regclass)
+     or (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_parted_2027'::regclass) is not true
      or pg_temp.policy_list('public.demo_parted_2027') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update' then
     raise exception 'FAIL h11: manual call did not secure the moved-in table or the attached partition';
   end if;
@@ -834,11 +849,11 @@ declare
   v_id uuid;
   v_n  bigint;
 begin
-  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_name_user'::regclass)
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_name_user'::regclass) is not true
      or pg_temp.policy_list('public.demo_name_user') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
      or exists (select 1 from pg_catalog.pg_policy p
                  where p.polrelid = 'public.demo_name_user'::regclass
-                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid))
+                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid), '')
                        not like '%auth.uid()%= user_id)') then
     raise exception 'FAIL i1: uuid user_id without a foreign key did not get RLS and 4 policies on user_id';
   end if;
@@ -874,26 +889,26 @@ begin
   reset role;
   raise notice 'PASS i1: uuid user_id without a foreign key -> RLS and 4 policies on user_id; anon denied, owner only, other user denied';
 
-  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_name_owner'::regclass)
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_name_owner'::regclass) is not true
      or pg_temp.policy_list('public.demo_name_owner') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
      or exists (select 1 from pg_catalog.pg_policy p
                  where p.polrelid = 'public.demo_name_owner'::regclass
-                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid))
+                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid), '')
                        not like '%auth.uid()%= owner_id)') then
     raise exception 'FAIL i2: uuid owner_id without a foreign key did not get 4 policies on owner_id';
   end if;
   if pg_temp.policy_list('public.demo_name_both') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
      or exists (select 1 from pg_catalog.pg_policy p
                  where p.polrelid = 'public.demo_name_both'::regclass
-                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid))
+                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid), '')
                        not like '%= user_id)') then
     raise exception 'FAIL i2: with both names and no foreign key, user_id was not chosen';
   end if;
   raise notice 'PASS i2: uuid owner_id without a foreign key -> 4 policies on owner_id; user_id preferred when both exist';
 
-  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_name_text'::regclass)
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_name_text'::regclass) is not true
      or pg_temp.policy_list('public.demo_name_text') <> ''
-     or not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_name_bigint'::regclass)
+     or (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_name_bigint'::regclass) is not true
      or pg_temp.policy_list('public.demo_name_bigint') <> '' then
     raise exception 'FAIL i3: user_id that is not uuid should give RLS on and no policies';
   end if;
@@ -902,7 +917,7 @@ begin
   if pg_temp.policy_list('public.demo_fk_wins') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
      or exists (select 1 from pg_catalog.pg_policy p
                  where p.polrelid = 'public.demo_fk_wins'::regclass
-                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid))
+                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid), '')
                        not like '%= author_id)') then
     raise exception 'FAIL i4: foreign key column author_id did not win over plain user_id';
   end if;
@@ -925,9 +940,9 @@ create table public.demo_fk_other_both (
 
 do $$
 begin
-  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_fk_other'::regclass)
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_fk_other'::regclass) is not true
      or pg_temp.policy_list('public.demo_fk_other') <> ''
-     or not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_fk_other_both'::regclass)
+     or (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_fk_other_both'::regclass) is not true
      or pg_temp.policy_list('public.demo_fk_other_both') <> '' then
     raise exception 'FAIL i5: user_id with a foreign key to another table should give RLS on and no policies (got % / %)',
       pg_temp.policy_list('public.demo_fk_other'), pg_temp.policy_list('public.demo_fk_other_both');
@@ -951,11 +966,11 @@ declare
   v_b uuid := current_setting('verify.user_b')::uuid;
   v_n bigint;
 begin
-  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_domain_fk'::regclass)
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_domain_fk'::regclass) is not true
      or pg_temp.policy_list('public.demo_domain_fk') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
      or exists (select 1 from pg_catalog.pg_policy p
                  where p.polrelid = 'public.demo_domain_fk'::regclass
-                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid))
+                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid), '')
                        not like '%auth.uid()%= (author_id)::uuid)') then
     raise exception 'FAIL i6: domain over uuid with a foreign key to auth.users did not get 4 policies on author_id (got %)',
       pg_temp.policy_list('public.demo_domain_fk');
@@ -986,11 +1001,11 @@ create table public.demo_domain_name (
 
 do $$
 begin
-  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_domain_name'::regclass)
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_domain_name'::regclass) is not true
      or pg_temp.policy_list('public.demo_domain_name') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
      or exists (select 1 from pg_catalog.pg_policy p
                  where p.polrelid = 'public.demo_domain_name'::regclass
-                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid))
+                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid), '')
                        not like '%auth.uid()%= (user_id)::uuid)') then
     raise exception 'FAIL i7: domain over uuid named user_id without a foreign key did not get 4 policies on user_id (got %)',
       pg_temp.policy_list('public.demo_domain_name');
@@ -999,11 +1014,47 @@ begin
 end;
 $$;
 
--- j. A role other than postgres that creates and owns tables in public, with the two
--- grants the README documents for it and no usage on schema auth.
+-- j. A role other than postgres that creates and owns tables in public, with no
+-- usage on schema auth. Check j0 runs before it has the two maintenance grants the
+-- README documents for it, j1 and j2 after.
 create role demo_role nologin;
 grant demo_role to current_user;
 grant usage, create on schema public to demo_role;
+
+-- j0. Without the maintenance grants its create table does not fail and the table
+-- is locked: RLS on and no policies, with and without an owner column. Each table
+-- prints WARNING 'rls_autogen: ... is locked (RLS on, no policies): owner policies
+-- were not added because role demo_role lacks ...'. j2 adds the policies with the
+-- manual call once the grants are in place.
+do $$
+declare
+  v_t regclass;
+begin
+  if pg_catalog.has_schema_privilege('demo_role', 'maintenance', 'USAGE') then
+    raise exception 'FAIL j0: setup: demo_role already has usage on schema maintenance, so a role without it cannot be tested';
+  end if;
+  perform pg_catalog.set_config('role', 'demo_role', true);
+  begin
+    create table public.demo_role_nogrant_plain (id int);
+    create table public.demo_role_nogrant_owned (id uuid primary key, user_id uuid);
+  exception when others then
+    raise exception 'FAIL j0: create table as demo_role without the maintenance grants raised an error: %', sqlerrm;
+  end;
+  reset role;
+  foreach v_t in array array['public.demo_role_nogrant_plain', 'public.demo_role_nogrant_owned']::regclass[] loop
+    if not exists (select 1 from pg_catalog.pg_class where oid = v_t and relowner = 'demo_role'::regrole) then
+      raise exception 'FAIL j0: % is not owned by demo_role, so it does not test a table created by demo_role', v_t;
+    end if;
+    if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) is not true
+       or pg_temp.policy_list(v_t) <> '' then
+      raise exception 'FAIL j0: % (created by demo_role without the maintenance grants) should have RLS on and no policies (got %)',
+        v_t, pg_temp.policy_list(v_t);
+    end if;
+  end loop;
+  raise notice 'PASS j0: demo_role without the maintenance grants creates tables without error; with and without an owner column -> RLS on, 0 policies';
+end;
+$$;
+
 grant usage on schema maintenance to demo_role;
 grant execute on function maintenance.apply_owner_policies(regclass) to demo_role;
 
@@ -1025,7 +1076,10 @@ begin
   end;
   reset role;
   foreach v_t in array array['public.demo_role_plain', 'public.demo_role_owned']::regclass[] loop
-    if not (select relrowsecurity from pg_catalog.pg_class where oid = v_t and relowner = 'demo_role'::regrole)
+    if not exists (select 1 from pg_catalog.pg_class where oid = v_t and relowner = 'demo_role'::regrole) then
+      raise exception 'FAIL j1: % is not owned by demo_role, so it does not test a table created by demo_role', v_t;
+    end if;
+    if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) is not true
        or pg_temp.policy_list(v_t) <> '' then
       raise exception 'FAIL j1: % (created by demo_role) should have RLS on and no policies (got %)', v_t, pg_temp.policy_list(v_t);
     end if;
@@ -1036,7 +1090,7 @@ $$;
 
 -- j2. The manual call by that owner works with the two grants. Without usage on
 -- schema auth it enables RLS and adds no policies; with it, the four policies.
-select maintenance.skip_rls_autogen();
+do $$ begin perform maintenance.skip_rls_autogen(); end $$;
 set local role demo_role;
 create table public.demo_role_manual (id uuid primary key, user_id uuid);
 reset role;
@@ -1046,13 +1100,13 @@ do $$
 declare
   v_t regclass := 'public.demo_role_manual';
 begin
-  if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) then
+  if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) is not false then
     raise exception 'FAIL j2: setup: % has RLS although maintenance.skip_rls_autogen() was called', v_t;
   end if;
   perform pg_catalog.set_config('role', 'demo_role', true);
   perform maintenance.apply_owner_policies(v_t);
   reset role;
-  if not (select relrowsecurity from pg_catalog.pg_class where oid = v_t) or pg_temp.policy_list(v_t) <> '' then
+  if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) is not true or pg_temp.policy_list(v_t) <> '' then
     raise exception 'FAIL j2: manual call by demo_role without usage on schema auth should give RLS on and no policies (got %)',
       pg_temp.policy_list(v_t);
   end if;
@@ -1065,7 +1119,7 @@ begin
   if not pg_catalog.has_schema_privilege('demo_role', 'auth', 'USAGE') then
     perform pg_catalog.set_config('verify.skipped',
       pg_catalog.concat_ws(',', nullif(pg_catalog.current_setting('verify.skipped', true), ''), 'j2'), true);
-    raise notice 'SKIP j2: manual call by demo_role with the two grants -> RLS on, 0 policies; % cannot give demo_role usage on schema auth (grant authenticated to demo_role), so the call with policies was not tested', current_user;
+    raise notice 'SKIP j2: manual call by demo_role with the two grants -> RLS on, 0 policies; % cannot give demo_role usage on schema auth (grant authenticated to demo_role), so the call with policies was not tested (also not on the tables j0 locked)', current_user;
     return;
   end if;
   perform pg_catalog.set_config('role', 'demo_role', true);
@@ -1074,7 +1128,23 @@ begin
   if pg_temp.policy_list(v_t) <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update' then
     raise exception 'FAIL j2: manual call by demo_role with usage on schema auth did not add 4 policies (got %)', pg_temp.policy_list(v_t);
   end if;
-  raise notice 'PASS j2: manual call by demo_role (owner, not postgres) with the two grants -> RLS on, 0 policies without usage on schema auth; 4 policies with it';
+
+  -- The fix the j0 warning gives: with the grants, the manual call on the locked tables.
+  perform pg_catalog.set_config('role', 'demo_role', true);
+  perform maintenance.apply_owner_policies('public.demo_role_nogrant_owned');
+  perform maintenance.apply_owner_policies('public.demo_role_nogrant_plain');
+  reset role;
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_role_nogrant_owned'::regclass) is not true
+     or pg_temp.policy_list('public.demo_role_nogrant_owned') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update' then
+    raise exception 'FAIL j2: manual call by demo_role on demo_role_nogrant_owned (locked in j0) did not add 4 policies (got %)',
+      pg_temp.policy_list('public.demo_role_nogrant_owned');
+  end if;
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_role_nogrant_plain'::regclass) is not true
+     or pg_temp.policy_list('public.demo_role_nogrant_plain') <> '' then
+    raise exception 'FAIL j2: demo_role_nogrant_plain (no owner column) should keep RLS on and no policies (got %)',
+      pg_temp.policy_list('public.demo_role_nogrant_plain');
+  end if;
+  raise notice 'PASS j2: manual call by demo_role (owner, not postgres) with the two grants -> RLS on, 0 policies without usage on schema auth; 4 policies with it, also on the table j0 locked';
 end;
 $$;
 
@@ -1083,7 +1153,7 @@ declare
   v_skipped text[] := pg_catalog.string_to_array(
                         nullif(pg_catalog.current_setting('verify.skipped', true), ''), ',');
 begin
-  if pg_catalog.cardinality(v_skipped) > 0 then
+  if coalesce(pg_catalog.cardinality(v_skipped), 0) > 0 then
     raise notice 'ALL CHECKS PASSED (% skipped: %)',
       pg_catalog.cardinality(v_skipped), pg_catalog.array_to_string(v_skipped, ', ');
   else

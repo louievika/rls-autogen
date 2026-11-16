@@ -86,6 +86,19 @@ grant execute on function maintenance.apply_owner_policies(regclass) to demo_rol
 
 Without usage on schema `auth`, that role gets RLS and no policies, and a `WARNING` says why.
 
+A role other than `postgres` that creates tables in `public` needs, for full behaviour:
+
+- `create` on schema `public`, to create the table at all;
+- usage on schema `maintenance` and execute on `maintenance.apply_owner_policies(regclass)` (the two grants above), for the trigger to add owner policies;
+- usage on schema `auth` (on Supabase, through membership in `authenticated`), for the policies themselves;
+- execute on `maintenance.skip_rls_autogen()`, to call the opt-out:
+
+```sql
+grant execute on function maintenance.skip_rls_autogen() to demo_role;
+```
+
+Without the two maintenance grants, its `create table` still succeeds: the trigger enables RLS on the new table itself (the creator owns it), adds no policies, and a `WARNING` names the table, the missing grants and the fix: the two grants above, then, as that role, `select maintenance.apply_owner_policies('public.demo_table');`. The table is locked until then. Without execute on `maintenance.skip_rls_autogen()`, the role cannot call the opt-out; setting the value by hand still works (see "Opt out").
+
 On a partitioned table that already has partitions, the call enables RLS and adds policies on the parent only. Its existing partitions keep RLS off, and a query on a partition itself does not apply the parent's policies. To cover the parent and every partition at every level:
 
 ```sql
@@ -160,23 +173,31 @@ Or paste it into the SQL editor and choose "Run without RLS" when asked. The edi
 
 It runs in one transaction that ends in `rollback`, so it leaves nothing behind. Inside that transaction it creates:
 
-- tables and domains named `public.demo_*`, two tables in `public` with quoted names, `"Demo Table"` and the injection test table `"demo_x""); drop table public.demo_posts; --"`, the schemas `demo_other_schema` and `demo_staging`, and the role `demo_role` with the two grants above, `create` on `public` and, for check j2, membership in `authenticated`; it stops with an error if one already exists;
+- tables and domains named `public.demo_*`, two tables in `public` with quoted names, `"Demo Table"` and the injection test table `"demo_x""); drop table public.demo_posts; --"`, the schemas `demo_other_schema` and `demo_staging`, and the role `demo_role` with `create` on `public`, after check j0 the two maintenance grants above and, for check j2, membership in `authenticated`; it stops with an error if one already exists;
 - a temporary table `demo_temp` and two temporary helper functions;
 - two `auth.users` rows with random ids;
 - the first of the extensions `pg_partman` and `postgis` that is available, not installed yet and can be created, in `public` (check h10, below).
 
-It acts as `anon` and as two signed-in users the way the Data API does (`set local role` plus `request.jwt.claims`). It checks: RLS on, the four policies, anon denied, owner allowed on their own rows only, another user denied, no-owner tables deny-all, the opt-out (check g: `maintenance.skip_rls_autogen()` skips, also inside and after savepoints, and a call rolled back with its savepoint is undone; check g2: a token of another transaction, and `off`, `false` or `0` set with `set local` or a plain `set`, are ignored and the table is protected), owner column choice, the name fallback (`user_id` or `owner_id` without a foreign key, non-uuid columns ignored, foreign key wins, a `user_id` with a foreign key to another table gets no policies), domains over `uuid`, quoted and unusual table names, re-runs, existing policies kept, `CREATE TABLE AS`, `SELECT INTO`, partitions, that other schemas and temporary tables are left alone, that tables created by an extension get RLS and no policies (check h10), that a role without usage on schema `auth` creates tables without error and gets RLS and no policies (check j1), and the manual call by an owner other than `postgres` with the two grants (check j2).
+It acts as `anon` and as two signed-in users the way the Data API does (`set local role` plus `request.jwt.claims`). It checks: RLS on, the four policies, anon denied, owner allowed on their own rows only, another user denied, no-owner tables deny-all, the opt-out (check g: `maintenance.skip_rls_autogen()` skips, also inside and after savepoints, and a call rolled back with its savepoint is undone; check g2: a token of another transaction, and `off`, `false` or `0` set with `set local` or a plain `set`, are ignored and the table is protected), owner column choice, the name fallback (`user_id` or `owner_id` without a foreign key, non-uuid columns ignored, foreign key wins, a `user_id` with a foreign key to another table gets no policies), domains over `uuid`, quoted and unusual table names, re-runs, existing policies kept, `CREATE TABLE AS`, `SELECT INTO`, partitions, that other schemas and temporary tables are left alone, that tables created by an extension get RLS and no policies (check h10), that a role without the two maintenance grants creates tables without error and gets RLS and no policies (check j0), that a role with them but without usage on schema `auth` does too (check j1), and the manual call by an owner other than `postgres` with the two grants, also on the tables j0 locked (check j2).
 
 For h10 it checks every table the extension it created put in `public`, by what happened to it. RLS on and no policies is a pass, whoever owns the table. Any policy is a FAIL. RLS off is a FAIL when the table is owned by the current role, because h10 first creates a probe table to show the trigger fires for that role (a platform that reassigns ownership of extension tables after creating them gives this result too). RLS off on a table owned by another role means the script ran as that role and the trigger did not fire for it; that table is recorded as not a test of the trigger. It tries `postgis` only if `pg_partman` tested no table. An error the trigger raises during `create extension` is a FAIL; any other error (a missing dependency, for example) marks that extension unusable, and the next one is tried. Check h11 pins a documented limit: a table moved into `public` with `set schema` and a partition attached with `attach partition` keep RLS off until the manual call.
 
-Each check prints one line: `NOTICE:  PASS <check>: ...`, `NOTICE:  SKIP <check>: ...`, or `ERROR:  FAIL <check>: ...`. The tables the opt-out checks skip on purpose (checks g, h6, h11 and j2) each print a `WARNING:  rls_autogen: RLS is not enabled on ...` line, each statement in check g2 prints `WARNING:  rls_autogen: ignored maintenance.rls_autogen = ...`, and checks j1 and j2 print `WARNING:  rls_autogen: ... has owner column user_id, but role demo_role has no usage on schema auth ...`; that is expected, and SQL cannot assert a warning, so read it in the output. A good run prints one `NOTICE:  PASS ...` line per check and ends with:
+Each check prints one line: `NOTICE:  PASS <check>: ...`, `NOTICE:  SKIP <check>: ...`, or `ERROR:  FAIL <check>: ...`. The tables the opt-out checks skip on purpose (checks g, h6, h11 and j2) each print a `WARNING:  rls_autogen: RLS is not enabled on ...` line, each statement in check g2 prints `WARNING:  rls_autogen: ignored maintenance.rls_autogen = ...`, check j0 prints `WARNING:  rls_autogen: ... is locked (RLS on, no policies): owner policies were not added because role demo_role lacks ...` for its two tables, and checks j1 and j2 print `WARNING:  rls_autogen: ... has owner column user_id, but role demo_role has no usage on schema auth ...`; that is expected, and SQL cannot assert a warning, so read it in the output. A good run prints one `NOTICE:  PASS ...` line per check and ends with:
 
 ```
 NOTICE:  ALL CHECKS PASSED
 ROLLBACK
 ```
 
-If neither extension is available, not installed yet and can be created, or each one created ran its script as another role for whom the trigger did not fire (the SKIP line names each table and that role), h10 prints `NOTICE:  SKIP h10: ...` instead of a PASS, and the last line reads `NOTICE:  ALL CHECKS PASSED (1 skipped: h10)`. That is not a full pass: extension tables were not tested. Likewise, check j2 prints `SKIP j2` when the role running the check cannot `grant authenticated to demo_role`.
+If neither extension is available, not installed yet and can be created, or each one created ran its script as another role for whom the trigger did not fire (the SKIP line names each table and that role), h10 prints `NOTICE:  SKIP h10: ...` instead of a PASS. Check j2 prints `NOTICE:  SKIP j2: ...` when the role running the check cannot `grant authenticated to demo_role`. These are the only two checks that can skip. The last line then reads one of:
+
+```
+NOTICE:  ALL CHECKS PASSED (1 skipped: h10)
+NOTICE:  ALL CHECKS PASSED (1 skipped: j2)
+NOTICE:  ALL CHECKS PASSED (2 skipped: h10, j2)
+```
+
+None of these is a full pass: a skipped check was not tested (h10: extension tables; j2: the manual call that adds policies for an owner other than `postgres`).
 
 A failing check stops with `ERROR:  FAIL <check>: <reason>`, and every later statement reports `current transaction is aborted` until the final `ROLLBACK`. Add `-v ON_ERROR_STOP=1` to make psql exit non-zero on failure. Any trigger you have on `auth.users` runs for the two test rows and is rolled back with them.
 
@@ -230,8 +251,8 @@ Run these as the trigger's owner (the role that installed it) or a superuser. Th
 - Table owners, roles with `BYPASSRLS` and `service_role` bypass RLS by design. On Supabase this includes `postgres`.
 - RLS is enabled, not forced, so the table owner is not restricted.
 - Policies only cover the owner case. Anything shared or public needs its own policies.
-- The functions run as the caller (`security invoker`), with an empty `search_path` and quoted identifiers. `public`, `anon` and `authenticated` have no access to the `maintenance` schema or its functions; only their owner and `postgres` do. A role that is not `postgres` and creates a table in `public` gets an error until it has the two grants under "Tables the trigger did not see", or opts out for that transaction (calling `maintenance.skip_rls_autogen()` needs usage on `maintenance` and execute on that function).
-- The opt-out covers every table created in `public` for the rest of its transaction, extension tables included. It is not a permission check: the role that creates a table owns it and could disable RLS on it anyway.
+- The functions run as the caller (`security invoker`), with an empty `search_path` and quoted identifiers. `public`, `anon` and `authenticated` have no access to the `maintenance` schema or its functions; only their owner and `postgres` do. A role that is not `postgres` and creates a table in `public` without the grants listed under "Tables the trigger did not see" gets the table with RLS on, no policies and a `WARNING` with the fix. That fails closed on purpose: no default grant is widened.
+- The opt-out covers every table created in `public` for the rest of its transaction, extension tables included. It is not a permission check: any role can set the value by hand, with or without execute on `maintenance.skip_rls_autogen()`, and the role that creates a table owns it and could disable RLS on it anyway.
 
 ## License
 

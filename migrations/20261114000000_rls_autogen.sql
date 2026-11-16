@@ -23,8 +23,8 @@
 --   (a NOTICE would be hidden, since Postgres shows only WARNING and above while
 --   an extension script runs).
 --   It is locked for anon and authenticated until you add a policy yourself.
---   This needs the script to run as a role that is not a superuser; see Known
---   limits.
+--   This needs the event trigger to fire for the role that runs the script; see
+--   Known limits.
 --
 -- Opt out for the tables created in one transaction
 --   set local maintenance.rls_autogen = 'off';
@@ -54,14 +54,18 @@
 --     the parent's policies. Run the same call on the partition, or enable RLS and
 --     add policies on it yourself. A partition created with CREATE TABLE ...
 --     PARTITION OF is covered.
---   - Extension tables. When the extension's script runs as the calling role (not
---     a superuser), its tables in public get RLS on, no policies and a WARNING. A
---     function or query that reads one as an API role (for example a coordinate
---     transform reading its reference table) gets no rows until you add a read
---     policy for that role. When the script runs as a superuser, its tables are
---     NOT touched and no message is shown, because event triggers do not fire for
---     superusers. Check such tables and secure them yourself. To list the tables
---     in public with RLS off:
+--   - Extension tables. When the event trigger fires for the role that runs the
+--     extension's script, its tables in public get RLS on, no policies and a
+--     WARNING. PostgreSQL documents no exception by role, so this holds for a
+--     superuser too; it documents event triggers as off only in single-user mode
+--     or with event_triggers = off (PostgreSQL 17 and later). A function or query
+--     that reads such a table as an API role (for example a coordinate transform
+--     reading its reference table) gets no rows until you add a read policy for
+--     that role. Some managed platforms skip event triggers for superuser or
+--     reserved roles. There, a table created by such a role, including by an
+--     extension script the platform runs as such a role, is NOT touched and no
+--     message is shown. After installing an extension, check its tables and
+--     secure them yourself. To list the tables in public with RLS off:
 --       select c.oid::regclass from pg_catalog.pg_class c
 --        where c.relnamespace = 'public'::regnamespace
 --          and c.relkind in ('r', 'p') and not c.relrowsecurity;

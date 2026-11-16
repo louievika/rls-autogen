@@ -39,12 +39,18 @@
 --
 -- Opt out for the tables created in one transaction
 --   begin; select maintenance.skip_rls_autogen(); create table ...; commit;
---   The function sets maintenance.rls_autogen to 'skip:<transaction id>' for the
---   current transaction only. The trigger skips a table only when the value is
---   exactly that for the transaction it runs in, and raises a WARNING naming the
---   table. Any other value ('off', a token of an earlier transaction, a plain set,
---   a role, database, server or connection value) is ignored: tables are protected
---   and one WARNING per statement says the value was ignored.
+--   The function sets maintenance.rls_autogen to the token
+--   'skip:<transaction id>:<transaction start time in microseconds since 1970>'
+--   for the current transaction only. The trigger skips a table only when the
+--   value is exactly that token for the transaction it runs in and the creating
+--   role has usage on schema maintenance and execute on
+--   maintenance.skip_rls_autogen(); it raises a WARNING naming the table. Any
+--   other value ('off', a token of an earlier transaction, a plain set, a role,
+--   database, server or connection value, or the token from a role without those
+--   grants) is ignored: tables are protected and one WARNING per statement says
+--   the value was ignored. Transaction ids count up, so a value stored ahead of
+--   time could name a later transaction id, but it would also have to contain
+--   the microsecond start time of a transaction that has not started yet.
 --
 -- Known limits (see README.md)
 --   - The opt-out covers every table created in public for the rest of its
@@ -76,9 +82,9 @@
 --   - The name rule trusts a uuid user_id or owner_id with no foreign key: without
 --     it a table created before its foreign key would get no policies; "Name
 --     fallback".
---   - Any role can set the opt-out token by hand inside its own transaction, with
---     or without execute on skip_rls_autogen(): the role that creates a table owns
---     it and can disable RLS on it anyway; "Opt out" and "By design".
+--   - The grants on skip_rls_autogen() control the opt-out, but a table's owner can
+--     still run alter table ... disable row level security on its own table: no
+--     trigger can prevent that; "By design".
 --   - Platforms that do not fire event triggers for superuser or reserved roles:
 --     outside a migration's control; the RLS-off query finds such tables; "Roles
 --     the trigger does not fire for".
@@ -227,9 +233,11 @@ end;
 $$;
 
 -- Opt out for the rest of the current transaction. The token is the top-level
--- transaction id (the same inside a savepoint). pg_current_xact_id() is used, not
--- the deprecated txid_current(); its 64-bit value includes the epoch, so it is not
--- reused after wraparound.
+-- transaction id and the transaction's start time as whole microseconds since
+-- 1970; both stay the same inside a savepoint, and the time is the same whatever
+-- the time zone or locale. pg_current_xact_id() is used, not the deprecated
+-- txid_current(); its 64-bit value includes the epoch, so it is not reused after
+-- wraparound. The trigger builds the same token to compare.
 create or replace function maintenance.skip_rls_autogen()
 returns void
 language plpgsql
@@ -238,7 +246,9 @@ set search_path = ''
 as $$
 begin
   perform pg_catalog.set_config('maintenance.rls_autogen',
-    'skip:' || pg_catalog.pg_current_xact_id()::text, true);
+    'skip:' || pg_catalog.pg_current_xact_id()::text || ':'
+      || (extract(epoch from pg_catalog.transaction_timestamp()) * 1000000)::bigint::text,
+    true);
 end;
 $$;
 
@@ -253,27 +263,21 @@ declare
   -- Watched schemas. Add names here to cover more schemas.
   c_schemas constant text[] := array['public'];
   v_value  text := coalesce(pg_catalog.current_setting('maintenance.rls_autogen', true), '');
+  v_usage  boolean := pg_catalog.has_schema_privilege('maintenance', 'USAGE');
   v_skip   boolean := false;
-  v_stale  boolean := false;
+  v_ignore text;
   v_oid    oid;
   v_in_ext boolean;
   v_ext    name;
   v_proc   oid;
   v_lack   text[] := '{}';
+  v_nskip  text[] := '{}';
 begin
-  if v_value <> '' then
-    -- Only the token of this (top-level) transaction skips. A transaction id is
-    -- never reused, so a value left by an earlier transaction, or stored for a
-    -- role, a database, the server or the connection, can never match.
-    v_skip  := v_value = 'skip:' || pg_catalog.pg_current_xact_id()::text;
-    v_stale := not v_skip;
-  end if;
-
   -- The event trigger fires without any grant, but apply_owner_policies runs as
   -- the creating role. Check that role's grants first, so that a role without
   -- them still gets a locked table instead of an error. Catalog lookup only:
   -- a regprocedure cast raises an error without usage on schema maintenance.
-  if not pg_catalog.has_schema_privilege('maintenance', 'USAGE') then
+  if not v_usage then
     v_lack := v_lack || 'usage on schema maintenance'::text;
   end if;
   select p.oid into v_proc
@@ -283,6 +287,39 @@ begin
      and p.pronargs = 1 and p.proargtypes[0] = 'pg_catalog.regclass'::pg_catalog.regtype;
   if v_proc is null or not pg_catalog.has_function_privilege(v_proc, 'EXECUTE') then
     v_lack := v_lack || 'execute on maintenance.apply_owner_policies(regclass)'::text;
+  end if;
+
+  if v_value <> '' then
+    -- Only the token of this (top-level) transaction skips: its id and its start
+    -- time, as skip_rls_autogen() writes it. A value stored ahead of time would
+    -- have to contain the microsecond start time of a transaction that has not
+    -- started yet.
+    if v_value = 'skip:' || pg_catalog.pg_current_xact_id()::text || ':'
+                 || (extract(epoch from pg_catalog.transaction_timestamp()) * 1000000)::bigint::text then
+      -- The token counts only for a role that may call skip_rls_autogen(): any
+      -- role can set the value by hand. Same catalog lookup as above.
+      if not v_usage then
+        v_nskip := v_nskip || 'usage on schema maintenance'::text;
+      end if;
+      select p.oid into v_proc
+        from pg_catalog.pg_proc p
+        join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+       where n.nspname = 'maintenance' and p.proname = 'skip_rls_autogen' and p.pronargs = 0;
+      if v_proc is null or not pg_catalog.has_function_privilege(v_proc, 'EXECUTE') then
+        v_nskip := v_nskip || 'execute on maintenance.skip_rls_autogen()'::text;
+      end if;
+      if pg_catalog.cardinality(v_nskip) = 0 then
+        v_skip := true;
+      else
+        v_ignore := pg_catalog.format(
+          'rls_autogen: ignored maintenance.rls_autogen = %L: role %I lacks %s, so it cannot opt out; tables are protected as usual.',
+          v_value, current_user, pg_catalog.array_to_string(v_nskip, ' and '));
+      end if;
+    else
+      v_ignore := pg_catalog.format(
+        'rls_autogen: ignored maintenance.rls_autogen = %L; tables are protected as usual. The supported opt-out is select maintenance.skip_rls_autogen(); inside the same transaction.',
+        v_value);
+    end if;
   end if;
 
   for v_oid, v_in_ext in
@@ -299,14 +336,13 @@ begin
   loop
     -- WARNING, not NOTICE, so both show at default client settings.
     if v_skip then
-      raise warning 'rls_autogen: RLS is not enabled on %: maintenance.skip_rls_autogen() was called in this transaction.',
+      raise warning 'rls_autogen: RLS is not enabled on %: the opt-out is set for this transaction.',
         v_oid::pg_catalog.regclass;
       continue;
     end if;
-    if v_stale then
-      raise warning 'rls_autogen: ignored maintenance.rls_autogen = %; tables are protected as usual. The supported opt-out is select maintenance.skip_rls_autogen(); inside the same transaction.',
-        pg_catalog.quote_literal(v_value);
-      v_stale := false;
+    if v_ignore is not null then
+      raise warning using message = v_ignore;
+      v_ignore := null;
     end if;
     begin
       if v_in_ext then
@@ -353,7 +389,8 @@ revoke all on function maintenance.rls_autogen() from public;
 -- Revokes for anon and authenticated, and grants to postgres, for the roles that exist.
 -- The trigger runs as the role that creates the table, and calls apply_owner_policies
 -- as that role. On Supabase that is postgres. The event trigger itself needs no grant;
--- another role without these grants gets RLS, no policies and a WARNING.
+-- another role without these grants gets RLS, no policies and a WARNING. The opt-out
+-- counts only for a role with usage on maintenance and execute on skip_rls_autogen().
 do $$
 declare
   v_role name;

@@ -11,7 +11,7 @@
 -- It creates tables and domains named public.demo_*, two more tables in public
 -- with quoted names (public."Demo Table" and the injection test table
 -- public."demo_x""); drop table public.demo_posts; --"), the schemas
--- demo_other_schema and demo_staging, the role demo_role (checks j0 to j2), a temporary
+-- demo_other_schema and demo_staging, the role demo_role (checks g1 and j0 to j2), a temporary
 -- table and two temporary functions, two throwaway rows in auth.users with random
 -- ids, and the first of the extensions pg_partman and postgis that is available
 -- and not installed yet and can be created (check h10).
@@ -34,17 +34,17 @@
 --   NOTICE 'ALL CHECKS PASSED (1 skipped: j2)'
 --   NOTICE 'ALL CHECKS PASSED (2 skipped: h10, j2)'
 -- Only the first is a full pass; a skipped check was not tested.
--- Checks g, h6, h11 and j2 opt out on purpose, so each table they skip prints
--- WARNING 'rls_autogen: RLS is not enabled on ...'. Check g2 sets values that must
--- be ignored, so each of its statements prints WARNING 'rls_autogen: ignored
--- maintenance.rls_autogen = ...'. Check j0 prints WARNING 'rls_autogen: ... is
--- locked (RLS on, no policies): owner policies were not added because role
--- demo_role lacks ...' for its two tables. Checks j1 and j2 print WARNING
--- 'rls_autogen: ... has owner column ..., but ...' for demo_role's tables. All
--- are expected.
+-- Checks g, g1, h6, h11 and j2 opt out on purpose, so each table they skip prints
+-- WARNING 'rls_autogen: RLS is not enabled on ...'. Checks g1, g2 and j2 set values
+-- that must be ignored, so each of those statements prints WARNING 'rls_autogen:
+-- ignored maintenance.rls_autogen = ...'. Checks g1 and j0 print WARNING
+-- 'rls_autogen: ... is locked (RLS on, no policies): owner policies were not added
+-- because role demo_role lacks ...' for their two tables each. Checks j1 and j2
+-- print WARNING 'rls_autogen: ... has owner column ..., but ...' for demo_role's
+-- tables. All are expected.
 -- The opt-out across transactions and in autocommit mode cannot be shown inside
 -- this file's single transaction; check g2 uses a token with another transaction
--- id instead.
+-- id and one with another start time instead.
 
 begin;
 -- Predicate checks read policies back as text; pin the path so they print auth.uid().
@@ -100,8 +100,11 @@ begin
   end if;
   begin
     create table public.demo_probe_0 (id int);
-  exception when insufficient_privilege then
-    raise exception 'FAIL 0: the trigger could not secure a table created by %: %', current_user, sqlerrm;
+  exception
+    when insufficient_privilege then
+      raise exception 'FAIL 0: the trigger could not secure a table created by %: %', current_user, sqlerrm;
+    when others then
+      raise exception 'FAIL 0: %', sqlerrm;
   end;
   select relrowsecurity into v_rls from pg_catalog.pg_class where oid = 'public.demo_probe_0'::regclass;
   drop table public.demo_probe_0;
@@ -341,17 +344,24 @@ $$;
 -- back to a savepoint taken after the call. Called inside a savepoint that is rolled
 -- back, the call is undone; inside one that is released, it stays. Cleared with
 -- set local maintenance.rls_autogen = '' before going on.
-do $$ begin perform maintenance.skip_rls_autogen(); end $$;
+do $$
+begin
+  perform maintenance.skip_rls_autogen();
+  perform pg_catalog.set_config('verify.xact',
+    pg_catalog.pg_current_xact_id()::text || ':'
+      || (extract(epoch from pg_catalog.transaction_timestamp()) * 1000000)::bigint::text, true);
+end;
+$$;
 create table public.demo_optout (id uuid primary key, user_id uuid references auth.users (id));
 savepoint demo_sp1;
 create table public.demo_optout_sp (id uuid primary key, user_id uuid references auth.users (id));
 
 do $$
 begin
-  if pg_catalog.current_setting('maintenance.rls_autogen', true)
-       is distinct from 'skip:' || pg_catalog.pg_current_xact_id()::text then
-    raise exception 'FAIL g: inside a savepoint the value is % and not the top-level token',
-      pg_catalog.current_setting('maintenance.rls_autogen', true);
+  if pg_catalog.pg_current_xact_id()::text || ':'
+       || (extract(epoch from pg_catalog.transaction_timestamp()) * 1000000)::bigint::text
+       is distinct from pg_catalog.current_setting('verify.xact') then
+    raise exception 'FAIL g: inside a savepoint the transaction id or start time is not that of the top-level transaction';
   end if;
   if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_optout_sp'::regclass) is not false
      or pg_temp.policy_list('public.demo_optout_sp') <> '' then
@@ -393,18 +403,96 @@ begin
 end;
 $$;
 
+-- g1. The token counts only for a role with usage on schema maintenance and execute
+-- on maintenance.skip_rls_autogen(). demo_role has neither. It sets by hand the exact
+-- token the function wrote in this transaction and creates two tables: both are
+-- protected (locked, since it also lacks the policy grants), and its statements
+-- print WARNING 'rls_autogen: ignored maintenance.rls_autogen = ...: role demo_role
+-- lacks ...'. The role running this file has the grants: the same token built by
+-- hand skips its table, like a call of the function.
+create role demo_role nologin;
+grant demo_role to current_user;
+grant usage, create on schema public to demo_role;
+
+do $$
+declare
+  v_tok  text;
+  v_hand text;
+  v_t    regclass;
+begin
+  if pg_catalog.has_schema_privilege('demo_role', 'maintenance', 'USAGE')
+     or pg_catalog.has_function_privilege('demo_role', 'maintenance.skip_rls_autogen()', 'EXECUTE') then
+    raise exception 'FAIL g1: setup: demo_role already has usage on schema maintenance or execute on maintenance.skip_rls_autogen()';
+  end if;
+  perform maintenance.skip_rls_autogen();
+  v_tok := pg_catalog.current_setting('maintenance.rls_autogen');
+  perform pg_catalog.set_config('maintenance.rls_autogen', '', true);
+  perform pg_catalog.set_config('role', 'demo_role', true);
+  begin
+    perform pg_catalog.set_config('maintenance.rls_autogen', v_tok, true);
+    create table public.demo_forged_plain (id int);
+    create table public.demo_forged_owned (id uuid primary key, user_id uuid);
+  exception when others then
+    raise exception 'FAIL g1: create table as demo_role with the token set by hand raised an error: %', sqlerrm;
+  end;
+  perform pg_catalog.set_config('maintenance.rls_autogen', '', true);
+  reset role;
+  foreach v_t in array array['public.demo_forged_plain', 'public.demo_forged_owned']::regclass[] loop
+    if not exists (select 1 from pg_catalog.pg_class where oid = v_t and relowner = 'demo_role'::regrole) then
+      raise exception 'FAIL g1: % is not owned by demo_role, so it does not test a table created by demo_role', v_t;
+    end if;
+    if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) is not true
+       or pg_temp.policy_list(v_t) <> '' then
+      raise exception 'FAIL g1: % was created by demo_role, which lacks the opt-out grants, with this transaction''s token set by hand; it should be locked, RLS on and no policies (got RLS %, policies %)',
+        v_t, (select relrowsecurity from pg_catalog.pg_class where oid = v_t), pg_temp.policy_list(v_t);
+    end if;
+  end loop;
+
+  v_hand := 'skip:' || pg_catalog.pg_current_xact_id()::text || ':'
+            || (extract(epoch from pg_catalog.transaction_timestamp()) * 1000000)::bigint::text;
+  if v_tok is distinct from v_hand then
+    raise exception 'FAIL g1: maintenance.skip_rls_autogen() wrote %, expected skip:<transaction id>:<start time in microseconds> = %',
+      v_tok, v_hand;
+  end if;
+  perform pg_catalog.set_config('maintenance.rls_autogen', v_hand, true);
+  create table public.demo_forged_granted (id uuid primary key, user_id uuid references auth.users (id));
+  perform pg_catalog.set_config('maintenance.rls_autogen', '', true);
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_forged_granted'::regclass) is not false
+     or pg_temp.policy_list('public.demo_forged_granted') <> '' then
+    raise exception 'FAIL g1: % set the token by hand with the opt-out grants, but its table got RLS or policies', current_user;
+  end if;
+  raise notice 'PASS g1: demo_role without the opt-out grants set this transaction''s token by hand -> its tables are locked (RLS on, 0 policies); the token is skip:<transaction id>:<start time in microseconds>, and % (with the grants) setting it by hand is skipped', current_user;
+end;
+$$;
+
 -- g2. Any value other than this transaction's token is ignored: the table gets RLS
 -- and its policies, and each statement raises one WARNING. A token with another
--- transaction id stands for a value left by an earlier transaction. 'off', 'FALSE'
--- and '0' with set local, and 'off' with a plain set, are ignored too. The trigger
--- must leave the value as it was.
+-- transaction id stands for a value left by an earlier transaction; a token with
+-- this transaction id and another start time, and one without the time, are
+-- ignored too, as are 'off', 'FALSE' and '0' with set local, and 'off' with a plain
+-- set. The trigger must leave the value as it was.
 do $$
 begin
   perform pg_catalog.set_config('maintenance.rls_autogen',
-    'skip:' || (pg_catalog.pg_current_xact_id()::text::bigint - 1)::text, true);
+    'skip:' || (pg_catalog.pg_current_xact_id()::text::bigint - 1)::text || ':'
+      || (extract(epoch from pg_catalog.transaction_timestamp()) * 1000000)::bigint::text, true);
 end;
 $$;
 create table public.demo_ignored_stale (id uuid primary key, user_id uuid references auth.users (id));
+do $$
+begin
+  perform pg_catalog.set_config('maintenance.rls_autogen',
+    'skip:' || pg_catalog.pg_current_xact_id()::text || ':'
+      || ((extract(epoch from pg_catalog.transaction_timestamp()) * 1000000)::bigint - 1)::text, true);
+end;
+$$;
+create table public.demo_ignored_wrong_time (id uuid primary key, user_id uuid references auth.users (id));
+do $$
+begin
+  perform pg_catalog.set_config('maintenance.rls_autogen', 'skip:' || pg_catalog.pg_current_xact_id()::text, true);
+end;
+$$;
+create table public.demo_ignored_no_time (id uuid primary key, user_id uuid references auth.users (id));
 set local maintenance.rls_autogen = 'off';
 create table public.demo_ignored_off (id uuid primary key, user_id uuid references auth.users (id));
 set local maintenance.rls_autogen = 'FALSE';
@@ -422,7 +510,8 @@ begin
     raise exception 'FAIL g2: the trigger changed maintenance.rls_autogen (now %)',
       pg_catalog.current_setting('maintenance.rls_autogen', true);
   end if;
-  foreach v_t in array array['public.demo_ignored_stale', 'public.demo_ignored_off', 'public.demo_ignored_false',
+  foreach v_t in array array['public.demo_ignored_stale', 'public.demo_ignored_wrong_time', 'public.demo_ignored_no_time',
+                             'public.demo_ignored_off', 'public.demo_ignored_false',
                              'public.demo_ignored_zero', 'public.demo_ignored_session']::regclass[] loop
     if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) is not true
        or pg_temp.policy_list(v_t) <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update' then
@@ -430,7 +519,7 @@ begin
         v_t, pg_temp.policy_list(v_t);
     end if;
   end loop;
-  raise notice 'PASS g2: a token of another transaction, off / FALSE / 0 with set local and off with a plain set are ignored -> RLS and 4 policies; value left as it was';
+  raise notice 'PASS g2: a token with another transaction id, one with this id and another start time, one without the time, off / FALSE / 0 with set local and off with a plain set are ignored -> RLS and 4 policies; value left as it was';
 end;
 $$;
 
@@ -1015,11 +1104,8 @@ end;
 $$;
 
 -- j. A role other than postgres that creates and owns tables in public, with no
--- usage on schema auth. Check j0 runs before it has the two maintenance grants the
--- README documents for it, j1 and j2 after.
-create role demo_role nologin;
-grant demo_role to current_user;
-grant usage, create on schema public to demo_role;
+-- usage on schema auth (demo_role, created for check g1). Check j0 runs before it
+-- has the two maintenance grants the README documents for it, j1 and j2 after.
 
 -- j0. Without the maintenance grants its create table does not fail and the table
 -- is locked: RLS on and no policies, with and without an owner column. Each table
@@ -1090,18 +1176,22 @@ $$;
 
 -- j2. The manual call by that owner works with the two grants. Without usage on
 -- schema auth it enables RLS and adds no policies; with it, the four policies.
-do $$ begin perform maintenance.skip_rls_autogen(); end $$;
+-- With execute on maintenance.skip_rls_autogen(), demo_role's own call skips its
+-- table; once that grant is revoked, the same token set by hand is ignored and its
+-- next table gets RLS and the four policies.
+grant execute on function maintenance.skip_rls_autogen() to demo_role;
 set local role demo_role;
+do $$ begin perform maintenance.skip_rls_autogen(); end $$;
 create table public.demo_role_manual (id uuid primary key, user_id uuid);
-reset role;
 set local maintenance.rls_autogen = '';
+reset role;
 
 do $$
 declare
   v_t regclass := 'public.demo_role_manual';
 begin
   if (select relrowsecurity from pg_catalog.pg_class where oid = v_t) is not false then
-    raise exception 'FAIL j2: setup: % has RLS although maintenance.skip_rls_autogen() was called', v_t;
+    raise exception 'FAIL j2: setup: % has RLS although demo_role, with execute on maintenance.skip_rls_autogen(), called it', v_t;
   end if;
   perform pg_catalog.set_config('role', 'demo_role', true);
   perform maintenance.apply_owner_policies(v_t);
@@ -1119,7 +1209,7 @@ begin
   if not pg_catalog.has_schema_privilege('demo_role', 'auth', 'USAGE') then
     perform pg_catalog.set_config('verify.skipped',
       pg_catalog.concat_ws(',', nullif(pg_catalog.current_setting('verify.skipped', true), ''), 'j2'), true);
-    raise notice 'SKIP j2: manual call by demo_role with the two grants -> RLS on, 0 policies; % cannot give demo_role usage on schema auth (grant authenticated to demo_role), so the call with policies was not tested (also not on the tables j0 locked)', current_user;
+    raise notice 'SKIP j2: manual call by demo_role with the two grants -> RLS on, 0 policies; % cannot give demo_role usage on schema auth (grant authenticated to demo_role), so the call with policies was not tested (also not on the tables j0 locked), nor the ignored token set by hand without execute on skip_rls_autogen()', current_user;
     return;
   end if;
   perform pg_catalog.set_config('role', 'demo_role', true);
@@ -1144,7 +1234,24 @@ begin
     raise exception 'FAIL j2: demo_role_nogrant_plain (no owner column) should keep RLS on and no policies (got %)',
       pg_temp.policy_list('public.demo_role_nogrant_plain');
   end if;
-  raise notice 'PASS j2: manual call by demo_role (owner, not postgres) with the two grants -> RLS on, 0 policies without usage on schema auth; 4 policies with it, also on the table j0 locked';
+
+  -- Without execute on skip_rls_autogen() (usage on schema maintenance kept), the
+  -- token demo_role builds by hand is ignored.
+  revoke execute on function maintenance.skip_rls_autogen() from demo_role;
+  perform pg_catalog.set_config('role', 'demo_role', true);
+  perform pg_catalog.set_config('maintenance.rls_autogen',
+    'skip:' || pg_catalog.pg_current_xact_id()::text || ':'
+      || (extract(epoch from pg_catalog.transaction_timestamp()) * 1000000)::bigint::text, true);
+  create table public.demo_role_forged (id uuid primary key, user_id uuid);
+  perform pg_catalog.set_config('maintenance.rls_autogen', '', true);
+  reset role;
+  if not exists (select 1 from pg_catalog.pg_class where oid = 'public.demo_role_forged'::regclass and relowner = 'demo_role'::regrole)
+     or (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_role_forged'::regclass) is not true
+     or pg_temp.policy_list('public.demo_role_forged') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update' then
+    raise exception 'FAIL j2: demo_role without execute on maintenance.skip_rls_autogen() set the token by hand; demo_role_forged should have RLS and 4 policies (got %)',
+      pg_temp.policy_list('public.demo_role_forged');
+  end if;
+  raise notice 'PASS j2: demo_role with execute on skip_rls_autogen() skips its table; manual call by demo_role (owner, not postgres) with the two grants -> RLS on, 0 policies without usage on schema auth; 4 policies with it, also on the table j0 locked; without execute on skip_rls_autogen() its token set by hand is ignored -> RLS and 4 policies';
 end;
 $$;
 

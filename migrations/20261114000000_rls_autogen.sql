@@ -1,77 +1,54 @@
 -- rls_autogen: row level security on by default for new tables in public.
+-- README.md has the details for everything below.
 --
 -- What it does
---   An event trigger runs after CREATE TABLE, CREATE TABLE AS and SELECT INTO.
---   Every new table, partitioned table or partition in public gets row level
---   security enabled (not forced). If the table has an owner column, meaning a
---   uuid column with a single-column foreign key to auth.users(id), it also gets
---   four policies for the authenticated role: owner_select, owner_insert,
---   owner_update and owner_delete, each limited to (select auth.uid()) = <column>.
---   With more than one such column, user_id is used, then owner_id; otherwise no
---   policies are created. Only when no such foreign key column exists, a uuid
---   column named exactly user_id, else exactly owner_id, is taken as the owner by
---   its name alone, and only if that column has no foreign key at all. If it has a
---   foreign key to another table, it is not the owner: no policies are created and
---   a notice says so. Foreign key columns always win over the name fallback. A
---   uuid column may also be a domain over uuid. If auth.users does not exist, no
---   policies are created and a notice says so. A table
---   without policies is deny-all for anon and authenticated. Existing policies with these names are kept as they are.
---   Grants are not changed. Re-running this file is safe.
---   A table created by an extension script (CREATE EXTENSION or ALTER EXTENSION
---   UPDATE) also gets RLS enabled, but never owner policies: no owner column is
---   guessed on an extension's table. A WARNING names the table and its extension
---   (a NOTICE would be hidden, since Postgres shows only WARNING and above while
---   an extension script runs).
---   It is locked for anon and authenticated until you add a policy yourself.
---   This needs the event trigger to fire for the role that runs the script; see
---   Known limits.
+--   An event trigger named rls_autogen runs after CREATE TABLE, CREATE TABLE AS
+--   and SELECT INTO. Every new table, partitioned table or partition in public
+--   gets row level security enabled (not forced).
+--   If the table has an owner column, it also gets four policies for the
+--   authenticated role: owner_select, owner_insert, owner_update and
+--   owner_delete, each limited to (select auth.uid()) = <owner column>. The
+--   owner can read, add, change and delete their own rows.
+--   The owner column is a uuid column with a single-column foreign key to
+--   auth.users(id); with several, user_id is used, then owner_id. Only when there
+--   is no such column, a uuid column named user_id, else owner_id, that has no
+--   foreign key at all is the owner by its name. A domain over uuid counts as
+--   uuid. With no owner column, or without auth.users, the table gets RLS and no
+--   policies, so it is deny-all for anon and authenticated. A notice says which
+--   case applied.
+--   A table created by an extension script gets RLS and no policies, and a
+--   WARNING, when the trigger fires for the role that runs the script.
+--   Existing policies with these names are kept. Grants are not changed.
+--   For a table the trigger did not see, run as its owner:
+--     select maintenance.apply_owner_policies('public.demo_posts');
+--
+-- Install
+--   Needs the roles anon, authenticated and postgres. Uses auth.users and
+--   auth.uid(). Creates the schema maintenance, or reuses an existing one, and
+--   revokes all access to it from public, anon and authenticated. Safe to run
+--   again; run it in one transaction (psql -1) so that the event trigger is not
+--   missing between its drop and its create.
 --
 -- Opt out for the tables created in one transaction
 --   set local maintenance.rls_autogen = 'off';
---   Only set local inside a transaction is supported. Set at any other level (a
---   plain set, alter role ... set, alter database ... set, connection options),
---   the switch keeps the trigger off for every later table on that connection,
---   role or database. A set left on a pooled connection carries over to the next
---   client that gets it. Each skipped table raises a WARNING that names it and
---   says RLS was NOT enabled; when the value is also set beyond this session's
---   own set commands, the WARNING says so and how to clear it. To check the
---   current value:
---     select pg_catalog.current_setting('maintenance.rls_autogen', true);
+--   Only set local is supported. Set at any other level, the switch keeps the
+--   trigger off for every later table until it is cleared. Each skipped table
+--   raises a WARNING.
 --
--- Known limits
---   - A foreign key added later with ALTER TABLE does not fire the trigger. Run
---     select maintenance.apply_owner_policies('public.your_table');
---   - A user_id or owner_id column whose foreign key to another table is added
---     after CREATE TABLE (as a schema restore does) already got the four name
---     fallback policies, and neither the new foreign key nor the call above
---     removes them; drop them yourself.
---   - Tables that existed before this migration are not changed. Same call.
---   - ALTER TABLE ... SET SCHEMA public does not fire the trigger, so a table moved
---     into public keeps RLS off. Run the same call on it, or enable RLS and add
---     policies on it yourself.
---   - ALTER TABLE ... ATTACH PARTITION does not fire the trigger, so an attached
---     partition keeps RLS off, and a query on the partition itself does not apply
---     the parent's policies. Run the same call on the partition, or enable RLS and
---     add policies on it yourself. A partition created with CREATE TABLE ...
---     PARTITION OF is covered.
---   - Extension tables. When the event trigger fires for the role that runs the
---     extension's script, its tables in public get RLS on, no policies and a
---     WARNING. PostgreSQL documents no exception by role, so this holds for a
---     superuser too; it documents event triggers as off only in single-user mode
---     or with event_triggers = off (PostgreSQL 17 and later). A function or query
---     that reads such a table as an API role (for example a coordinate transform
---     reading its reference table) gets no rows until you add a read policy for
---     that role. Some managed platforms skip event triggers for superuser or
---     reserved roles. There, a table created by such a role, including by an
---     extension script the platform runs as such a role, is NOT touched and no
---     message is shown. After installing an extension, check its tables and
---     secure them yourself. To list the tables in public with RLS off:
---       select c.oid::regclass from pg_catalog.pg_class c
---        where c.relnamespace = 'public'::regnamespace
---          and c.relkind in ('r', 'p') and not c.relrowsecurity;
---   - Table owners, roles with BYPASSRLS and service_role bypass RLS by design.
+-- Known limits (see README.md)
+--   - Not covered: views, materialized views, foreign tables, tables created
+--     inside CREATE SCHEMA, tables moved in with SET SCHEMA, partitions added
+--     with ATTACH PARTITION, foreign keys added later, and tables that existed
+--     before this file. Use the manual call where RLS can be enabled.
+--   - The manual call on a partitioned table does not change its partitions.
+--   - A user_id or owner_id whose foreign key to another table is added later
+--     keeps the name fallback policies.
+--   - Restoring a dump with the trigger enabled adds policies, causes duplicate
+--     policy errors and locks tables. Disable the trigger for the restore.
+--   - Table owners, roles with BYPASSRLS and service_role bypass RLS.
 --   - On hosted Supabase, event triggers do not fire for superuser or reserved
 --     roles (supabase_admin, service_role, anon, authenticated and others).
+--     Tables they create, including extension tables, keep RLS off.
 
 create schema if not exists maintenance;
 revoke all on schema maintenance from public, anon, authenticated;

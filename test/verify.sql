@@ -8,11 +8,20 @@
 -- when the trigger did not fire for the role running this file.
 --
 -- Everything runs in one transaction that ends in ROLLBACK, so nothing is left behind.
--- It creates tables and domains named public.demo_* and two throwaway rows in auth.users with random ids.
+-- It creates tables and domains named public.demo_*, the schemas demo_other_schema
+-- and demo_staging, a temporary table and two temporary functions, two throwaway
+-- rows in auth.users with random ids, and the first of the extensions pg_partman
+-- and postgis that is available and not installed yet (check h10).
 -- Any trigger you have on auth.users runs for those two rows (and is rolled back with them).
+-- Run it with a search_path that does not include auth (for example
+-- PGOPTIONS='-c search_path=public'): check b reads the policies back as text,
+-- and with auth on the path they print uid() instead of auth.uid().
 --
--- Each check raises NOTICE 'PASS: ...' or stops with ERROR 'FAIL: ...'. Check h10
--- (extension tables) raises NOTICE 'SKIP h10: ...' instead when neither pg_partman
+-- Output, one line per check:
+--   PASS <check>: ...   (NOTICE)
+--   FAIL <check>: ...   (ERROR; the transaction is aborted)
+--   SKIP <check>: ...   (NOTICE)
+-- Check h10 (extension tables) prints SKIP h10 instead of PASS when neither pg_partman
 -- nor postgis is available and not installed yet, or when each one it creates ran
 -- its script as another role for whom the trigger did not fire (not a test of
 -- the trigger).

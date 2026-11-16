@@ -567,6 +567,64 @@ begin
 end;
 $$;
 
+-- h11 documents a limit, not a feature. ALTER TABLE ... SET SCHEMA public and
+-- ALTER TABLE ... ATTACH PARTITION have the command tag ALTER TABLE, which the
+-- trigger does not listen to, so the moved-in table and the attached partition
+-- keep RLS off. The manual call then secures them. (A partition created with
+-- CREATE TABLE ... PARTITION OF is covered; see h8.)
+create schema demo_staging;
+create table demo_staging.demo_moved (
+  id      uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users (id)
+);
+alter table demo_staging.demo_moved set schema public;
+set local maintenance.rls_autogen = 'off';
+create table public.demo_parted_2027 (like public.demo_parted including defaults);
+set local maintenance.rls_autogen = 'on';
+alter table public.demo_parted attach partition public.demo_parted_2027
+  for values from ('2027-01-01') to ('2028-01-01');
+grant select, insert, update, delete on public.demo_moved, public.demo_parted_2027 to authenticated;
+
+do $$
+declare
+  v_a uuid := current_setting('verify.user_a')::uuid;
+  v_b uuid := current_setting('verify.user_b')::uuid;
+  v_n bigint;
+begin
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_moved'::regclass)
+     or pg_temp.policy_list('public.demo_moved') <> '' then
+    raise exception 'FAIL h11: table moved into public with set schema was changed; update the documented limit';
+  end if;
+  if (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_parted_2027'::regclass)
+     or pg_temp.policy_list('public.demo_parted_2027') <> '' then
+    raise exception 'FAIL h11: partition attached with attach partition was changed; update the documented limit';
+  end if;
+
+  -- A query on the attached partition itself does not apply the parent's policies.
+  insert into public.demo_parted (user_id, created) values (v_a, '2027-06-01');
+  perform pg_temp.act_as('authenticated', v_b::text);
+  select count(*) into v_n from public.demo_parted where created >= '2027-01-01';
+  if v_n <> 0 then raise exception 'FAIL h11: other user sees % rows through the parent', v_n; end if;
+  select count(*) into v_n from public.demo_parted_2027;
+  if v_n <> 1 then raise exception 'FAIL h11: other user sees % rows in the attached partition, expected 1 (RLS off)', v_n; end if;
+  reset role;
+
+  perform maintenance.apply_owner_policies('public.demo_moved');
+  perform maintenance.apply_owner_policies('public.demo_parted_2027');
+  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_moved'::regclass)
+     or pg_temp.policy_list('public.demo_moved') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
+     or not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_parted_2027'::regclass)
+     or pg_temp.policy_list('public.demo_parted_2027') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update' then
+    raise exception 'FAIL h11: manual call did not secure the moved-in table or the attached partition';
+  end if;
+  perform pg_temp.act_as('authenticated', v_b::text);
+  select count(*) into v_n from public.demo_parted_2027;
+  if v_n <> 0 then raise exception 'FAIL h11: other user sees % rows in the attached partition after the manual call', v_n; end if;
+  reset role;
+  raise notice 'PASS h11: documented limit: set schema public and attach partition leave RLS off (other user read the attached partition directly); manual call adds RLS and 4 policies';
+end;
+$$;
+
 -- i. Name fallback, used only when no uuid foreign key to auth.users exists.
 create table public.demo_name_user (
   id      uuid primary key default gen_random_uuid(),

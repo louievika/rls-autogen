@@ -27,6 +27,14 @@
 --   - A foreign key added later with ALTER TABLE does not fire the trigger. Run
 --     select maintenance.apply_owner_policies('public.your_table');
 --   - Tables that existed before this migration are not changed. Same call.
+--   - ALTER TABLE ... SET SCHEMA public does not fire the trigger, so a table moved
+--     into public keeps RLS off. Run the same call on it, or enable RLS and add
+--     policies on it yourself.
+--   - ALTER TABLE ... ATTACH PARTITION does not fire the trigger, so an attached
+--     partition keeps RLS off, and a query on the partition itself does not apply
+--     the parent's policies. Run the same call on the partition, or enable RLS and
+--     add policies on it yourself. A partition created with CREATE TABLE ...
+--     PARTITION OF is covered.
 --   - Extension tables get RLS and no policies. A function or query that reads one
 --     as an API role (for example a coordinate transform reading its reference
 --     table) gets no rows until you add a read policy for that role.

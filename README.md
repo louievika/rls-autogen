@@ -77,12 +77,14 @@ Existing tables, or a table that got its owner foreign key later through `alter 
 select maintenance.apply_owner_policies('public.demo_posts');
 ```
 
-Run it as the table owner. It is idempotent. It changes only the table you name. An owner other than `postgres` first needs these two grants, run by the owner of `maintenance`:
+Run it as the table owner. It is idempotent. It changes only the table you name. An owner other than `postgres` first needs these two grants:
 
 ```sql
 grant usage on schema maintenance to demo_role;
 grant execute on function maintenance.apply_owner_policies(regclass) to demo_role;
 ```
+
+Run the first as the owner of schema `maintenance` and the second as the owner of the functions, which is the role that installed the file; a superuser can run both. They are the same role unless the schema existed before the install. The `WARNING` described below names both roles.
 
 Without usage on schema `auth`, that role gets RLS and no policies, and a `WARNING` says why.
 
@@ -120,7 +122,7 @@ To watch more schemas than `public`, add them to the `c_schemas` array at the to
 
 - The roles `anon`, `authenticated` and `postgres` are expected, not created. The file revokes access from `anon` and `authenticated` and grants to `postgres`; for a role that does not exist it skips that step and prints a notice.
 - `auth.users` is optional. Without it, every new table gets RLS and no policies, and a notice says so.
-- Owner policies need the function `auth.uid()` returning `uuid`, the role `authenticated`, and usage on schema `auth` for the role that creates the table. If one is missing, a table with an owner column gets RLS and no policies, and a `WARNING` names the table and the reason. Tables without an owner column are not affected.
+- Owner policies need the function `auth.uid()` returning `uuid`, the role `authenticated` with usage on schema `auth` and execute on `auth.uid()` (the policies call it as `authenticated`), and usage on schema `auth` for the role that creates the table. If one is missing, a table with an owner column gets RLS and no policies, and a `WARNING` names the table and the reason. Tables without an owner column are not affected.
 - PostgreSQL 13 or later (the opt-out uses `pg_current_xact_id()`).
 - The role that runs the file must be allowed to create event triggers. In plain PostgreSQL that is a superuser.
 
@@ -128,7 +130,7 @@ To watch more schemas than `public`, add them to the `c_schemas` array at the to
 
 Before you install: the file creates a schema named `maintenance` if it does not exist, then revokes all access to it from `public`, `anon` and `authenticated`. If you already have a schema with that name, those roles lose access to it and to everything in it, and functions named `maintenance.apply_owner_policies(regclass)`, `maintenance.skip_rls_autogen()` and `maintenance.rls_autogen()` are replaced.
 
-Copy `migrations/20261114000000_rls_autogen.sql` into `supabase/migrations/` and apply it as you apply other migrations, for example:
+Copy `migrations/20261115000000_rls_autogen.sql` into `supabase/migrations/` and apply it as you apply other migrations, for example:
 
 ```sh
 supabase db push
@@ -137,10 +139,12 @@ supabase db push
 Or run the file as the `postgres` role, in one transaction:
 
 ```sh
-psql "$DATABASE_URL" -1 -v ON_ERROR_STOP=1 -f migrations/20261114000000_rls_autogen.sql
+psql "$DATABASE_URL" -1 -v ON_ERROR_STOP=1 -f migrations/20261115000000_rls_autogen.sql
 ```
 
 It creates a schema `maintenance` with three functions, and one event trigger named `rls_autogen`. The file is safe to run again. A re-run drops and recreates the event trigger. When the file runs in one transaction, as above, no table can be created between the two steps, and an error rolls back the whole file. If your migration tool does not run each file in one transaction, use the `psql` command.
+
+If you installed 1.0.0 (`20261114000000_rls_autogen.sql`), add the new file next to it and do not edit the old one; applied over 1.0.0 it ends in the same state as a fresh install. The opt-out changed: see "Opt out" and `CHANGELOG.md`.
 
 ## Opt out
 
@@ -155,7 +159,7 @@ commit;
 
 Every table created in `public` for the rest of that transaction is skipped, including tables an extension script creates, and each one raises a `WARNING` that names it. The function sets `maintenance.rls_autogen`, for that transaction only, to the token `skip:<transaction id>:<start time>`, where the start time is the transaction's start in whole microseconds since 1970 (the same in every time zone and locale, and inside savepoints). The trigger skips a table only when the value is exactly that token for the transaction it runs in and the creating role has usage on schema `maintenance` and execute on `maintenance.skip_rls_autogen()`. The next transaction is protected again, also on a pooled connection. Call it inside the transaction that creates the tables: run on its own in autocommit mode, it is its own transaction and skips nothing. Called before a savepoint, it still applies after `rollback to savepoint`; called inside a savepoint that is rolled back, it is undone. To protect later tables in the same transaction again, run `set local maintenance.rls_autogen = '';`.
 
-Any other value is ignored: `off`, a value left by an earlier transaction, a plain `set`, a value set for a role or a database, in the server configuration or in the connection options, and the exact token set by a role without those two grants. The table is protected as usual, and the statement raises one `WARNING` saying the value was ignored (for a role without the grants, which grant it lacks). A stored value no longer turns anything off; clear it (for example `alter role demo_role reset maintenance.rls_autogen`) to stop the warning.
+Any other value is ignored: `off`, a value left by an earlier transaction, a plain `set`, a value set for a role or a database, in the server configuration or in the connection options, and the exact token set by a role without those two grants. The table is protected as usual, and each statement that creates a table in a watched schema raises one `WARNING` saying the value was ignored (for a role without the grants, which grant it lacks). A stored value no longer turns anything off; clear it (for example `alter role demo_role reset maintenance.rls_autogen`) to stop the warning.
 
 Setting the value by hand to the exact token, in the same transaction, is the same as calling the function: accepted for a role with the two grants, ignored for any other. Transaction ids count up, so a value stored ahead of time for a role or a database can name a later transaction id; to match, it would also have to contain the microsecond start time of a transaction that has not started yet.
 
@@ -167,7 +171,7 @@ After installing, run the self-check as `postgres`:
 psql "$DATABASE_URL" -f test/verify.sql
 ```
 
-Run it as a role the trigger fires for, such as the role that creates your tables. Check 0 creates a probe table and stops with `FAIL 0` and the reason when the trigger did not fire for the role running the check, for example on a platform where the trigger may not fire for superuser or reserved roles.
+Run it as a role the trigger fires for, such as the role that creates your tables. Check 0 creates a probe table and stops with `FAIL 0` and the reason when the trigger did not fire for the role running the check, for example on a platform where the trigger may not fire for superuser or reserved roles. It also stops with `FAIL 0` naming the missing grant when that role lacks usage on schema `maintenance` or execute on `maintenance.apply_owner_policies(regclass)` or `maintenance.skip_rls_autogen()`, and when one of the three functions does not run with exactly `search_path = pg_catalog, pg_temp`.
 
 Or paste it into the SQL editor and choose "Run without RLS" when asked. The editor shows only the result of the last statement, the `rollback`, so it shows Success for a full pass and for a run with a skipped check alike; the PASS, SKIP and final lines appear only in psql. It takes a few seconds.
 
@@ -251,7 +255,24 @@ Run these as the trigger's owner (the role that installed it) or a superuser. Th
 - Table owners, roles with `BYPASSRLS` and `service_role` bypass RLS by design. On Supabase this includes `postgres`.
 - RLS is enabled, not forced, so the table owner is not restricted.
 - Policies only cover the owner case. Anything shared or public needs its own policies.
-- The functions run as the caller (`security invoker`), with an empty `search_path` and quoted identifiers. `public`, `anon` and `authenticated` have no access to the `maintenance` schema or its functions; only their owner and `postgres` do. A role that is not `postgres` and creates a table in `public` without the grants listed under "Tables the trigger did not see" gets the table with RLS on, no policies and a `WARNING` with the fix. That fails closed on purpose: no default grant is widened.
+- The functions run as the caller (`security invoker`), with `search_path` pinned to `pg_catalog, pg_temp` (the temporary schema last), schema-qualified names and types, and quoted identifiers.
+- The install revokes all access to schema `maintenance` and its three functions from `public`, `anon` and `authenticated`, and grants usage on the schema and execute on `apply_owner_policies` and `skip_rls_autogen` to `postgres`. It does not revoke from other roles: on a `maintenance` schema that existed before, earlier grants or default privileges can give other roles access. To list every role that holds usage on the schema or execute on one of the three functions, directly, through role membership or as a superuser:
+
+```sql
+select 'schema maintenance' as object, r.rolname as role
+  from pg_catalog.pg_roles r
+ where pg_catalog.has_schema_privilege(r.oid, 'maintenance', 'USAGE')
+union all
+select p.oid::regprocedure::text, r.rolname
+  from pg_catalog.pg_proc p
+  cross join pg_catalog.pg_roles r
+ where p.pronamespace = 'maintenance'::regnamespace
+   and p.proname in ('apply_owner_policies', 'skip_rls_autogen', 'rls_autogen')
+   and pg_catalog.has_function_privilege(r.oid, p.oid, 'EXECUTE')
+ order by 1, 2;
+```
+
+- A role that is not `postgres` and creates a table in `public` without the grants listed under "Tables the trigger did not see" gets the table with RLS on, no policies and a `WARNING` with the fix. That fails closed on purpose: no default grant is widened.
 - The opt-out covers every table created in `public` for the rest of its transaction, extension tables included. The grants control it: the trigger honours the token only for a role with usage on schema `maintenance` and execute on `maintenance.skip_rls_autogen()`, however the value was set.
 - A table's owner can still run `alter table ... disable row level security` on their own table; no trigger can prevent that (accepted).
 

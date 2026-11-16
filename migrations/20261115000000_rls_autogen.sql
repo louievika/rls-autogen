@@ -18,13 +18,15 @@
 --   counts as uuid. With no owner column, or without auth.users, the table gets RLS and no
 --   policies, so it is deny-all for anon and authenticated. A notice says which
 --   case applied. When the table has an owner column but auth.uid() or the role
---   authenticated is missing, or the caller has no usage on schema auth, it gets
---   RLS and no policies, and a WARNING names the table and the reason.
+--   authenticated is missing, the caller has no usage on schema auth, or
+--   authenticated has no usage on schema auth or no execute on auth.uid(), it
+--   gets RLS and no policies, and a WARNING names the table and the reason.
 --   A table created by an extension script gets RLS and no policies, and a
 --   WARNING, when the trigger fires for the role that runs the script.
 --   A creating role without usage on schema maintenance and execute on
 --   maintenance.apply_owner_policies(regclass) gets RLS and no policies, and a
---   WARNING with the two grants and the manual call that add them.
+--   WARNING with the two grants, the roles that can give them and the manual
+--   call that adds the policies.
 --   Existing policies with these names are kept. Grants are not changed.
 --   For a table the trigger did not see, run as its owner:
 --     select maintenance.apply_owner_policies('public.demo_posts');
@@ -35,7 +37,10 @@
 --   reuses an existing one, and revokes all access to it from public, anon and
 --   authenticated. Safe to run
 --   again; run it in one transaction (psql -1) so that the event trigger is not
---   missing between its drop and its create.
+--   missing between its drop and its create. Over an installed 1.0.0 it ends in
+--   the same state as a fresh install: it revokes the execute on
+--   maintenance.rls_autogen() that 1.0.0 granted to postgres. Add this file next
+--   to the 1.0.0 file; do not edit that one.
 --
 -- Opt out for the tables created in one transaction
 --   begin; select maintenance.skip_rls_autogen(); create table ...; commit;
@@ -47,8 +52,8 @@
 --   maintenance.skip_rls_autogen(); it raises a WARNING naming the table. Any
 --   other value ('off', a token of an earlier transaction, a plain set, a role,
 --   database, server or connection value, or the token from a role without those
---   grants) is ignored: tables are protected and one WARNING per statement says
---   the value was ignored. Transaction ids count up, so a value stored ahead of
+--   grants) is ignored: tables are protected and each statement that creates a
+--   table in a watched schema raises one WARNING saying the value was ignored. Transaction ids count up, so a value stored ahead of
 --   time could name a later transaction id, but it would also have to contain
 --   the microsecond start time of a transaction that has not started yet.
 --
@@ -101,22 +106,23 @@ revoke all on schema maintenance from public;
 
 -- Enable RLS on one table and add the owner policies when an owner column is found.
 -- Runs as the caller, who must own the table.
-create or replace function maintenance.apply_owner_policies(p_table regclass)
-returns void
+create or replace function maintenance.apply_owner_policies(p_table pg_catalog.regclass)
+returns pg_catalog.void
 language plpgsql
 security invoker
-set search_path = ''
+set search_path = pg_catalog, pg_temp
 as $$
 declare
-  v_kind  "char";
-  v_auth  oid;
-  v_users oid;
-  v_uuid  name[];
-  v_cols  name[];
-  v_owner name;
-  v_refs  text;
-  v_pred  text;
-  v_why   text[] := '{}';
+  v_kind  pg_catalog."char";
+  v_auth  pg_catalog.oid;
+  v_users pg_catalog.oid;
+  v_uid   pg_catalog.oid;
+  v_uuid  pg_catalog.name[];
+  v_cols  pg_catalog.name[];
+  v_owner pg_catalog.name;
+  v_refs  pg_catalog.text;
+  v_pred  pg_catalog.text;
+  v_why   pg_catalog.text[] := '{}';
 begin
   select c.relkind into v_kind from pg_catalog.pg_class c where c.oid = p_table;
   if v_kind is null or v_kind not in ('r', 'p') then
@@ -174,7 +180,7 @@ begin
       raise notice 'rls_autogen: % has no owner column (uuid foreign key to auth.users.id, or uuid column user_id or owner_id without a foreign key); RLS is on, no policies created', p_table;
       return;
     end if;
-    select pg_catalog.string_agg(distinct k.confrelid::pg_catalog.regclass::text, ', ') into v_refs
+    select pg_catalog.string_agg(distinct k.confrelid::pg_catalog.regclass::pg_catalog.text, ', ') into v_refs
       from pg_catalog.pg_constraint k
       join pg_catalog.pg_attribute a on a.attrelid = k.conrelid and a.attnum = any (k.conkey)
      where k.conrelid = p_table
@@ -198,16 +204,27 @@ begin
   end if;
 
   -- The policies need these. Without them the table stays locked: RLS on, no policies.
+  -- The creating role needs usage on schema auth to create them; authenticated, for
+  -- which the policies call auth.uid(), needs usage on auth and execute on auth.uid().
   if not pg_catalog.has_schema_privilege(v_auth, 'USAGE') then
     v_why := v_why || pg_catalog.format('role %I has no usage on schema auth', current_user);
   end if;
-  if not exists (select 1 from pg_catalog.pg_proc p
-                  where p.pronamespace = v_auth and p.proname = 'uid' and p.pronargs = 0
-                    and p.prorettype = 'pg_catalog.uuid'::pg_catalog.regtype) then
-    v_why := v_why || 'function auth.uid() returning uuid does not exist'::text;
+  select p.oid into v_uid
+    from pg_catalog.pg_proc p
+   where p.pronamespace = v_auth and p.proname = 'uid' and p.pronargs = 0
+     and p.prorettype = 'pg_catalog.uuid'::pg_catalog.regtype;
+  if v_uid is null then
+    v_why := v_why || 'function auth.uid() returning uuid does not exist'::pg_catalog.text;
   end if;
   if not exists (select 1 from pg_catalog.pg_roles r where r.rolname = 'authenticated') then
-    v_why := v_why || 'role authenticated does not exist'::text;
+    v_why := v_why || 'role authenticated does not exist'::pg_catalog.text;
+  else
+    if not pg_catalog.has_schema_privilege('authenticated', v_auth, 'USAGE') then
+      v_why := v_why || 'role authenticated has no usage on schema auth'::pg_catalog.text;
+    end if;
+    if v_uid is not null and not pg_catalog.has_function_privilege('authenticated', v_uid, 'EXECUTE') then
+      v_why := v_why || 'role authenticated has no execute on auth.uid()'::pg_catalog.text;
+    end if;
   end if;
   if pg_catalog.cardinality(v_why) > 0 then
     raise warning 'rls_autogen: % has owner column %, but %; RLS is on, no policies created. Add policies yourself.',
@@ -239,54 +256,64 @@ $$;
 -- txid_current(); its 64-bit value includes the epoch, so it is not reused after
 -- wraparound. The trigger builds the same token to compare.
 create or replace function maintenance.skip_rls_autogen()
-returns void
+returns pg_catalog.void
 language plpgsql
 security invoker
-set search_path = ''
+set search_path = pg_catalog, pg_temp
 as $$
 begin
   perform pg_catalog.set_config('maintenance.rls_autogen',
-    'skip:' || pg_catalog.pg_current_xact_id()::text || ':'
-      || (extract(epoch from pg_catalog.transaction_timestamp()) * 1000000)::bigint::text,
+    'skip:' || pg_catalog.pg_current_xact_id()::pg_catalog.text || ':'
+      || (extract(epoch from pg_catalog.transaction_timestamp()) * 1000000)::pg_catalog.int8::pg_catalog.text,
     true);
 end;
 $$;
 
 -- Event trigger function: applies the above to each new table in the watched schemas.
 create or replace function maintenance.rls_autogen()
-returns event_trigger
+returns pg_catalog.event_trigger
 language plpgsql
 security invoker
-set search_path = ''
+set search_path = pg_catalog, pg_temp
 as $$
 declare
   -- Watched schemas. Add names here to cover more schemas.
-  c_schemas constant text[] := array['public'];
-  v_value  text := coalesce(pg_catalog.current_setting('maintenance.rls_autogen', true), '');
-  v_usage  boolean := pg_catalog.has_schema_privilege('maintenance', 'USAGE');
-  v_skip   boolean := false;
-  v_ignore text;
-  v_oid    oid;
-  v_in_ext boolean;
-  v_ext    name;
-  v_proc   oid;
-  v_lack   text[] := '{}';
-  v_nskip  text[] := '{}';
+  c_schemas constant pg_catalog.text[] := array['public'];
+  v_value  pg_catalog.text := coalesce(pg_catalog.current_setting('maintenance.rls_autogen', true), '');
+  v_usage  pg_catalog.bool := pg_catalog.has_schema_privilege('maintenance', 'USAGE');
+  v_skip   pg_catalog.bool := false;
+  v_ignore pg_catalog.text;
+  v_oid    pg_catalog.oid;
+  v_in_ext pg_catalog.bool;
+  v_ext    pg_catalog.name;
+  v_proc   pg_catalog.oid;
+  v_lack   pg_catalog.text[] := '{}';
+  v_nskip  pg_catalog.text[] := '{}';
+  v_nspown pg_catalog.text;
+  v_fnown  pg_catalog.text;
 begin
   -- The event trigger fires without any grant, but apply_owner_policies runs as
   -- the creating role. Check that role's grants first, so that a role without
   -- them still gets a locked table instead of an error. Catalog lookup only:
   -- a regprocedure cast raises an error without usage on schema maintenance.
   if not v_usage then
-    v_lack := v_lack || 'usage on schema maintenance'::text;
+    v_lack := v_lack || 'usage on schema maintenance'::pg_catalog.text;
   end if;
-  select p.oid into v_proc
+  select p.oid, pg_catalog.quote_ident(r.rolname) into v_proc, v_fnown
     from pg_catalog.pg_proc p
     join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+    left join pg_catalog.pg_roles r on r.oid = p.proowner
    where n.nspname = 'maintenance' and p.proname = 'apply_owner_policies'
      and p.pronargs = 1 and p.proargtypes[0] = 'pg_catalog.regclass'::pg_catalog.regtype;
+  -- The roles that can give the two grants, for the WARNING below: the owner of the
+  -- schema and the owner of the function (the role that installed this file). They
+  -- differ when the schema existed before the install.
+  select pg_catalog.quote_ident(r.rolname) into v_nspown
+    from pg_catalog.pg_namespace n
+    join pg_catalog.pg_roles r on r.oid = n.nspowner
+   where n.nspname = 'maintenance';
   if v_proc is null or not pg_catalog.has_function_privilege(v_proc, 'EXECUTE') then
-    v_lack := v_lack || 'execute on maintenance.apply_owner_policies(regclass)'::text;
+    v_lack := v_lack || 'execute on maintenance.apply_owner_policies(regclass)'::pg_catalog.text;
   end if;
 
   if v_value <> '' then
@@ -294,19 +321,19 @@ begin
     -- time, as skip_rls_autogen() writes it. A value stored ahead of time would
     -- have to contain the microsecond start time of a transaction that has not
     -- started yet.
-    if v_value = 'skip:' || pg_catalog.pg_current_xact_id()::text || ':'
-                 || (extract(epoch from pg_catalog.transaction_timestamp()) * 1000000)::bigint::text then
+    if v_value = 'skip:' || pg_catalog.pg_current_xact_id()::pg_catalog.text || ':'
+                 || (extract(epoch from pg_catalog.transaction_timestamp()) * 1000000)::pg_catalog.int8::pg_catalog.text then
       -- The token counts only for a role that may call skip_rls_autogen(): any
       -- role can set the value by hand. Same catalog lookup as above.
       if not v_usage then
-        v_nskip := v_nskip || 'usage on schema maintenance'::text;
+        v_nskip := v_nskip || 'usage on schema maintenance'::pg_catalog.text;
       end if;
       select p.oid into v_proc
         from pg_catalog.pg_proc p
         join pg_catalog.pg_namespace n on n.oid = p.pronamespace
        where n.nspname = 'maintenance' and p.proname = 'skip_rls_autogen' and p.pronargs = 0;
       if v_proc is null or not pg_catalog.has_function_privilege(v_proc, 'EXECUTE') then
-        v_nskip := v_nskip || 'execute on maintenance.skip_rls_autogen()'::text;
+        v_nskip := v_nskip || 'execute on maintenance.skip_rls_autogen()'::pg_catalog.text;
       end if;
       if pg_catalog.cardinality(v_nskip) = 0 then
         v_skip := true;
@@ -365,11 +392,13 @@ begin
         execute pg_catalog.format('alter table %s enable row level security', v_oid::pg_catalog.regclass);
         raise warning using message = pg_catalog.format(
           'rls_autogen: %s is locked (RLS on, no policies): owner policies were not added because role %I lacks %s. '
-          'To add them, run as the owner of schema maintenance: grant usage on schema maintenance to %I; '
+          'To add them: as role %s (owner of schema maintenance) or a superuser, grant usage on schema maintenance to %I; '
+          'as role %s (owner of maintenance.apply_owner_policies) or a superuser, '
           'grant execute on function maintenance.apply_owner_policies(regclass) to %I; '
           'then, as %I: select maintenance.apply_owner_policies(%L);',
           v_oid::pg_catalog.regclass, current_user, pg_catalog.array_to_string(v_lack, ' and '),
-          current_user, current_user, current_user, v_oid::pg_catalog.regclass::text);
+          coalesce(v_nspown, '(unknown)'), current_user, coalesce(v_fnown, '(unknown)'), current_user,
+          current_user, v_oid::pg_catalog.regclass::pg_catalog.text);
       else
         perform maintenance.apply_owner_policies(v_oid::pg_catalog.regclass);
       end if;
@@ -393,7 +422,7 @@ revoke all on function maintenance.rls_autogen() from public;
 -- counts only for a role with usage on maintenance and execute on skip_rls_autogen().
 do $$
 declare
-  v_role name;
+  v_role pg_catalog.name;
 begin
   foreach v_role in array array['anon', 'authenticated'] loop
     if exists (select 1 from pg_catalog.pg_roles where rolname = v_role) then
@@ -409,6 +438,16 @@ begin
     grant usage on schema maintenance to postgres;
     grant execute on function maintenance.apply_owner_policies(regclass) to postgres;
     grant execute on function maintenance.skip_rls_autogen() to postgres;
+    -- 1.0.0 granted execute on the event trigger function to postgres; it needs
+    -- none. Revoke that grant so a re-run over 1.0.0 ends like a fresh install.
+    -- Not when postgres owns the function: that would remove the owner's own
+    -- execute, which a fresh install keeps.
+    if not exists (select 1 from pg_catalog.pg_proc p
+                     join pg_catalog.pg_roles r on r.oid = p.proowner
+                    where p.oid = 'maintenance.rls_autogen()'::pg_catalog.regprocedure
+                      and r.rolname = 'postgres') then
+      revoke execute on function maintenance.rls_autogen() from postgres;
+    end if;
   else
     raise notice 'rls_autogen: role postgres does not exist; its grant was skipped';
   end if;

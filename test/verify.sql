@@ -1,6 +1,6 @@
 -- rls_autogen self-check.
 --
--- Run as postgres after applying migrations/20261114000000_rls_autogen.sql:
+-- Run as postgres after applying migrations/20261115000000_rls_autogen.sql:
 --   psql "$DATABASE_URL" -f test/verify.sql
 -- or paste the whole file into the SQL editor.
 -- Run it as a role the event trigger fires for. Some managed platforms skip event
@@ -86,13 +86,17 @@ begin
 end;
 $$;
 
--- 0. Setup: the trigger is installed, fires for the role running this file, and
+-- 0. Setup: the trigger is installed, fires for the role running this file, that
+-- role has the maintenance grants, the three functions pin their search_path, and
 -- the role simulation works. Every later check needs the trigger to fire for
 -- current_user, so a probe table shows that first and names the cause if not.
 do $$
 declare
-  v_uid uuid;
-  v_rls boolean;
+  v_uid  uuid;
+  v_rls  boolean;
+  v_lack text[] := '{}';
+  v_fn   text;
+  v_cfg  text[];
 begin
   if not exists (select 1 from pg_catalog.pg_event_trigger
                   where evtname = 'rls_autogen' and evtenabled <> 'D') then
@@ -114,6 +118,33 @@ begin
       (select rolsuper from pg_catalog.pg_roles where rolname = current_user),
       coalesce(pg_catalog.current_setting('maintenance.rls_autogen', true), '(not set)');
   end if;
+  -- The later checks call the functions as this role. Catalog lookup by oid, so a
+  -- missing usage on the schema is reported instead of raising its own error.
+  if not pg_catalog.has_schema_privilege('maintenance', 'USAGE') then
+    v_lack := v_lack || 'usage on schema maintenance'::text;
+  end if;
+  foreach v_fn in array array['apply_owner_policies', 'skip_rls_autogen'] loop
+    if not exists (select 1 from pg_catalog.pg_proc p
+                    where p.pronamespace = 'maintenance'::regnamespace and p.proname = v_fn
+                      and pg_catalog.has_function_privilege(p.oid, 'EXECUTE')) then
+      v_lack := v_lack || pg_catalog.format('execute on maintenance.%s(%s)', v_fn,
+                                              case when v_fn = 'apply_owner_policies' then 'regclass' else '' end);
+    end if;
+  end loop;
+  if pg_catalog.cardinality(v_lack) > 0 then
+    raise exception 'FAIL 0: role % lacks %; the owner of schema maintenance and of its functions (or a superuser) can grant them, or run this file as the role that installed it',
+      current_user, pg_catalog.array_to_string(v_lack, ' and ');
+  end if;
+  -- Each function runs with search_path pg_catalog, then pg_temp last.
+  foreach v_fn in array array['apply_owner_policies', 'skip_rls_autogen', 'rls_autogen'] loop
+    select p.proconfig into v_cfg
+      from pg_catalog.pg_proc p
+     where p.pronamespace = 'maintenance'::regnamespace and p.proname = v_fn;
+    if v_cfg is distinct from array['search_path=pg_catalog, pg_temp'] then
+      raise exception 'FAIL 0: maintenance.% has settings %, expected exactly {"search_path=pg_catalog, pg_temp"}',
+        v_fn, coalesce(v_cfg::text, '(none)');
+    end if;
+  end loop;
   perform pg_temp.act_as('authenticated', pg_catalog.current_setting('verify.user_a'));
   select auth.uid() into v_uid;
   if v_uid is distinct from pg_catalog.current_setting('verify.user_a')::uuid
@@ -121,7 +152,7 @@ begin
     raise exception 'FAIL 0: role simulation broken (current_user %, auth.uid() %)', current_user, v_uid;
   end if;
   reset role;
-  raise notice 'PASS 0: event trigger installed and fires for %; auth.uid() returns the simulated user', current_user;
+  raise notice 'PASS 0: event trigger installed and fires for %, which has usage on schema maintenance and execute on apply_owner_policies and skip_rls_autogen; the three functions run with search_path pg_catalog, pg_temp; auth.uid() returns the simulated user', current_user;
 end;
 $$;
 

@@ -165,19 +165,19 @@ Setting the value by hand to the exact token, in the same transaction, is the sa
 
 ## Verify
 
-After installing, run the self-check as `postgres`:
+After installing, run the self-check as `postgres`, the same role as the install:
 
 ```sh
 psql "$DATABASE_URL" -f test/verify.sql
 ```
 
-Run it as a role the trigger fires for, such as the role that creates your tables. Check 0 stops with `FAIL 0` when the trigger is missing or not enabled always (`evtenabled = 'A'`). It creates a probe table and stops with `FAIL 0` and the reason when the trigger did not fire for the role running the check, for example on a platform where the trigger may not fire for superuser or reserved roles. It also stops with `FAIL 0` when the login role lacks usage on schema `maintenance` or execute on `maintenance.skip_rls_autogen()`, and naming the missing grant when the role running the check lacks usage on schema `maintenance` or execute on `maintenance.apply_owner_policies(regclass)` or `maintenance.skip_rls_autogen()`, and when one of the three functions does not run with exactly `search_path = pg_catalog, pg_temp`.
+The install gives `postgres` the `maintenance` grants the check needs, and the trigger must fire for that role. Check 0 stops with `FAIL 0` when the trigger is missing or not enabled always (`evtenabled = 'A'`). It creates a probe table and stops with `FAIL 0` and the reason when the trigger did not fire for the role running the check, for example on a platform where the trigger may not fire for superuser or reserved roles. It also stops with `FAIL 0` when the login role lacks usage on schema `maintenance` or execute on `maintenance.skip_rls_autogen()`, and naming the missing grant when the role running the check lacks usage on schema `maintenance` or execute on `maintenance.apply_owner_policies(regclass)` or `maintenance.skip_rls_autogen()`, and when one of the three functions does not run with exactly `search_path = pg_catalog, pg_temp`.
 
 Or paste it into the SQL editor and choose "Run without RLS" when asked. The editor shows only the result of the last statement, the `rollback`, so it shows Success for a full pass and for a run with a skipped check alike; the PASS, SKIP and final lines appear only in psql. It takes a few seconds.
 
 It runs in one transaction that ends in `rollback`, so it leaves nothing behind. Inside that transaction it creates:
 
-- tables and domains named `public.demo_*`, two tables in `public` with quoted names, `"Demo Table"` and the injection test table `"demo_x""); drop table public.demo_posts; --"`, the schemas `demo_other_schema` and `demo_staging`, the role `demo_role` with `create` on `public` and the function `public.demo_definer_make(text)` it owns (check g3), after check j0 the two maintenance grants above and, for check j2, membership in `authenticated` and execute on `maintenance.skip_rls_autogen()`; if one of these already exists, the run stops at the statement that creates it with the Postgres `already exists` error (`FAIL 0: ...` for the probe table of check 0), possibly after some PASS lines, and never prints `ALL CHECKS PASSED`;
+- tables and domains named `public.demo_*`, two tables in `public` with quoted names, `"demo_Mixed Case"` and the injection test table `"demo_x""); drop table public.demo_posts; --"`, the schemas `demo_other_schema` and `demo_staging`, the role `demo_role` with `create` on `public` and the function `public.demo_definer_make(text)` it owns (check g3), after check j0 the two maintenance grants above and, for check j2, membership in `authenticated` and execute on `maintenance.skip_rls_autogen()`; if one of these already exists, the run stops at the statement that creates it with the Postgres `already exists` error (`FAIL 0: ...` for the probe table of check 0), possibly after some PASS lines, and never prints `ALL CHECKS PASSED`;
 - a temporary table `demo_temp` and two temporary helper functions;
 - two `auth.users` rows with random ids;
 - the first of the extensions `pg_partman` and `postgis` that is available, not installed yet and can be created, in `public` (check h10, below).

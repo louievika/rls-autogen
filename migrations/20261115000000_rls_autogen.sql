@@ -15,12 +15,13 @@
 --   column user_id or, only if there is no uuid user_id, owner_id, and uses it
 --   only if that column has no foreign key at all. So a user_id with any foreign
 --   key means no policies, even if a plain owner_id exists. A domain over uuid
---   counts as uuid. With no owner column, or without auth.users, the table gets RLS and no
---   policies, so it is deny-all for anon and authenticated. A notice says which
---   case applied. When the table has an owner column but auth.uid() or the role
---   authenticated is missing, the caller has no usage on schema auth, or
---   authenticated has no usage on schema auth or no execute on auth.uid(), it
---   gets RLS and no policies, and a WARNING names the table and the reason.
+--   counts as uuid. With no owner column, or without auth.users, the table gets
+--   RLS and no policies, so it is deny-all for anon and authenticated. A notice
+--   says which case applied. When the table has an owner column but auth.uid()
+--   or the role authenticated is missing, the caller has no usage on schema
+--   auth, or authenticated has no usage on schema auth or no execute on
+--   auth.uid(), it gets RLS and no policies, and a WARNING names the table and
+--   the reason.
 --   A table created by an extension script gets RLS and no policies, and a
 --   WARNING, when the trigger fires for the role that runs the script.
 --   A creating role without usage on schema maintenance and execute on
@@ -307,7 +308,8 @@ declare
   v_oid    pg_catalog.oid;
   v_in_ext pg_catalog.bool;
   v_ext    pg_catalog.name;
-  v_proc   pg_catalog.oid;
+  v_apply_fn pg_catalog.oid;
+  v_skip_fn  pg_catalog.oid;
   v_lack   pg_catalog.text[] := '{}';
   v_nskip  pg_catalog.text[] := '{}';
   v_role   pg_catalog.name;
@@ -322,7 +324,7 @@ begin
   if not v_usage then
     v_lack := v_lack || 'usage on schema maintenance'::pg_catalog.text;
   end if;
-  select p.oid, pg_catalog.quote_ident(r.rolname) into v_proc, v_fnown
+  select p.oid, pg_catalog.quote_ident(r.rolname) into v_apply_fn, v_fnown
     from pg_catalog.pg_proc p
     join pg_catalog.pg_namespace n on n.oid = p.pronamespace
     left join pg_catalog.pg_roles r on r.oid = p.proowner
@@ -335,7 +337,7 @@ begin
     from pg_catalog.pg_namespace n
     join pg_catalog.pg_roles r on r.oid = n.nspowner
    where n.nspname = 'maintenance';
-  if v_proc is null or not pg_catalog.has_function_privilege(v_proc, 'EXECUTE') then
+  if v_apply_fn is null or not pg_catalog.has_function_privilege(v_apply_fn, 'EXECUTE') then
     v_lack := v_lack || 'execute on maintenance.apply_owner_policies(regclass)'::pg_catalog.text;
   end if;
 
@@ -350,7 +352,7 @@ begin
       -- skip_rls_autogen(): any role can set the value by hand, and inside a
       -- function that runs with its owner's rights current_user is the owner, not
       -- the caller. Same catalog lookup as above.
-      select p.oid into v_proc
+      select p.oid into v_skip_fn
         from pg_catalog.pg_proc p
         join pg_catalog.pg_namespace n on n.oid = p.pronamespace
        where n.nspname = 'maintenance' and p.proname = 'skip_rls_autogen' and p.pronargs = 0;
@@ -360,7 +362,7 @@ begin
         if not pg_catalog.has_schema_privilege(v_role, 'maintenance', 'USAGE') then
           v_rlack := v_rlack || 'usage on schema maintenance'::pg_catalog.text;
         end if;
-        if v_proc is null or not pg_catalog.has_function_privilege(v_role, v_proc, 'EXECUTE') then
+        if v_skip_fn is null or not pg_catalog.has_function_privilege(v_role, v_skip_fn, 'EXECUTE') then
           v_rlack := v_rlack || 'execute on maintenance.skip_rls_autogen()'::pg_catalog.text;
         end if;
         if pg_catalog.cardinality(v_rlack) > 0 then

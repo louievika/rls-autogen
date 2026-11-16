@@ -3,13 +3,14 @@
 -- Run as postgres after applying migrations/20261115000000_rls_autogen.sql:
 --   psql "$DATABASE_URL" -f test/verify.sql
 -- or paste the whole file into the SQL editor.
--- Run it as a role the event trigger fires for. Some managed platforms skip event
--- triggers for superuser or reserved roles; check 0 stops with FAIL 0 and says so
--- when the trigger did not fire for the role running this file.
+-- The install gives postgres the maintenance grants this file needs, and the event
+-- trigger must fire for that role. Some managed platforms skip event triggers for
+-- superuser or reserved roles; check 0 stops with FAIL 0 and says so when the
+-- trigger did not fire for the role running this file.
 --
 -- Everything runs in one transaction that ends in ROLLBACK, so nothing is left behind.
 -- It creates tables and domains named public.demo_*, two more tables in public
--- with quoted names (public."Demo Table" and the injection test table
+-- with quoted names (public."demo_Mixed Case" and the injection test table
 -- public."demo_x""); drop table public.demo_posts; --"), the schemas
 -- demo_other_schema and demo_staging, the role demo_role (checks g1, g3 and j0 to j2), the
 -- function public.demo_definer_make(text) (check g3), a temporary
@@ -127,41 +128,47 @@ begin
   select relrowsecurity into v_rls from pg_catalog.pg_class where oid = 'public.demo_probe_0'::regclass;
   drop table public.demo_probe_0;
   if v_rls is not true then
-    raise exception 'FAIL 0: the trigger did not fire for a table created by role % (superuser: %, maintenance.rls_autogen: %). Some managed platforms skip event triggers for superuser or reserved roles; run this file as a role the trigger fires for, such as the role that creates your tables.',
+    raise exception 'FAIL 0: the trigger did not fire for a table created by role % (superuser: %, maintenance.rls_autogen: %). Some managed platforms skip event triggers for superuser or reserved roles; run this file as postgres, a role the trigger must fire for.',
       current_user,
       (select rolsuper from pg_catalog.pg_roles where rolname = current_user),
       coalesce(pg_catalog.current_setting('maintenance.rls_autogen', true), '(not set)');
   end if;
-  -- The later checks call the functions as this role. Catalog lookup by oid, so a
-  -- missing usage on the schema is reported instead of raising its own error.
+  -- The later checks call the functions as this role. Each function is looked up
+  -- by its exact signature. A signature lookup raises its own error without usage
+  -- on the schema, so it runs only with usage; without it, that grant is reported.
   if not pg_catalog.has_schema_privilege('maintenance', 'USAGE') then
     v_lack := v_lack || 'usage on schema maintenance'::text;
+  else
+    foreach v_fn in array array['maintenance.apply_owner_policies(regclass)',
+                                'maintenance.skip_rls_autogen()'] loop
+      if pg_catalog.to_regprocedure(v_fn) is null
+         or not pg_catalog.has_function_privilege(pg_catalog.to_regprocedure(v_fn), 'EXECUTE') then
+        v_lack := v_lack || ('execute on ' || v_fn);
+      end if;
+    end loop;
   end if;
-  foreach v_fn in array array['apply_owner_policies', 'skip_rls_autogen'] loop
-    if not exists (select 1 from pg_catalog.pg_proc p
-                    where p.pronamespace = 'maintenance'::regnamespace and p.proname = v_fn
-                      and pg_catalog.has_function_privilege(p.oid, 'EXECUTE')) then
-      v_lack := v_lack || pg_catalog.format('execute on maintenance.%s(%s)', v_fn,
-                                              case when v_fn = 'apply_owner_policies' then 'regclass' else '' end);
-    end if;
-  end loop;
   if pg_catalog.cardinality(v_lack) > 0 then
     raise exception 'FAIL 0: role % lacks %; the owner of schema maintenance and of its functions (or a superuser) can grant them, or run this file as the role that installed it',
       current_user, pg_catalog.array_to_string(v_lack, ' and ');
   end if;
   -- The opt-out checks also need the login role to hold the opt-out grants.
   if not pg_catalog.has_schema_privilege(session_user, 'maintenance', 'USAGE')
-     or not pg_catalog.has_function_privilege(session_user, 'maintenance.skip_rls_autogen()', 'EXECUTE') then
+     or not pg_catalog.has_function_privilege(session_user, 'maintenance.skip_rls_autogen()'::regprocedure,
+                                              'EXECUTE') then
     raise exception 'FAIL 0: session user % lacks usage on schema maintenance or execute on maintenance.skip_rls_autogen(); the opt-out counts only when the session user has them too. Log in as a role that has them to run this file',
       session_user;
   end if;
   -- Each function runs with search_path pg_catalog, then pg_temp last.
-  foreach v_fn in array array['apply_owner_policies', 'skip_rls_autogen', 'rls_autogen'] loop
+  foreach v_fn in array array['maintenance.apply_owner_policies(regclass)',
+                              'maintenance.skip_rls_autogen()', 'maintenance.rls_autogen()'] loop
+    if pg_catalog.to_regprocedure(v_fn) is null then
+      raise exception 'FAIL 0: function % does not exist', v_fn;
+    end if;
     select p.proconfig into v_cfg
       from pg_catalog.pg_proc p
-     where p.pronamespace = 'maintenance'::regnamespace and p.proname = v_fn;
+     where p.oid = pg_catalog.to_regprocedure(v_fn);
     if v_cfg is distinct from array['search_path=pg_catalog, pg_temp'] then
-      raise exception 'FAIL 0: maintenance.% has settings %, expected exactly {"search_path=pg_catalog, pg_temp"}',
+      raise exception 'FAIL 0: % has settings %, expected exactly {"search_path=pg_catalog, pg_temp"}',
         v_fn, coalesce(v_cfg::text, '(none)');
     end if;
   end loop;
@@ -262,7 +269,8 @@ begin
 end;
 $$;
 
--- d. The owner (user A) can insert, read, update and delete their own row, and not insert for user B.
+-- d. The owner (user A) can insert, read, update and delete their own row, and not
+-- insert for user B.
 do $$
 declare
   v_a  uuid := current_setting('verify.user_a')::uuid;
@@ -671,7 +679,7 @@ end;
 $$;
 
 -- Awkward identifiers: spaces, mixed case, a double quote, and SQL in the name.
-create table public."Demo Table" (
+create table public."demo_Mixed Case" (
   "Row Id"    uuid primary key default gen_random_uuid(),
   "Owner""Col" uuid not null references auth.users (id),
   "Body"      text
@@ -680,7 +688,7 @@ create table public."demo_x""); drop table public.demo_posts; --" (
   id      uuid primary key default gen_random_uuid(),
   user_id uuid references auth.users (id)
 );
-grant select, insert, update, delete on public."Demo Table" to authenticated;
+grant select, insert, update, delete on public."demo_Mixed Case" to authenticated;
 
 do $$
 declare
@@ -688,9 +696,9 @@ declare
   v_b uuid := current_setting('verify.user_b')::uuid;
   v_n bigint;
 begin
-  if pg_temp.policy_list('public."Demo Table"') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
-     or (select relrowsecurity from pg_catalog.pg_class where oid = 'public."Demo Table"'::regclass) is not true then
-    raise exception 'FAIL h4: "Demo Table" not secured';
+  if pg_temp.policy_list('public."demo_Mixed Case"') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
+     or (select relrowsecurity from pg_catalog.pg_class where oid = 'public."demo_Mixed Case"'::regclass) is not true then
+    raise exception 'FAIL h4: "demo_Mixed Case" not secured';
   end if;
   if pg_temp.policy_list('public."demo_x""); drop table public.demo_posts; --"') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
      or pg_catalog.to_regclass('public.demo_posts') is null then
@@ -698,17 +706,17 @@ begin
   end if;
 
   perform pg_temp.act_as('authenticated', v_a::text);
-  insert into public."Demo Table" ("Owner""Col", "Body") values (v_a, 'mine');
-  select count(*) into v_n from public."Demo Table";
-  if v_n <> 1 then raise exception 'FAIL h4: owner sees % rows in "Demo Table"', v_n; end if;
+  insert into public."demo_Mixed Case" ("Owner""Col", "Body") values (v_a, 'mine');
+  select count(*) into v_n from public."demo_Mixed Case";
+  if v_n <> 1 then raise exception 'FAIL h4: owner sees % rows in "demo_Mixed Case"', v_n; end if;
   begin
-    insert into public."Demo Table" ("Owner""Col", "Body") values (v_b, 'theirs');
-    raise exception 'FAIL h4: insert for another user succeeded on "Demo Table"';
+    insert into public."demo_Mixed Case" ("Owner""Col", "Body") values (v_b, 'theirs');
+    raise exception 'FAIL h4: insert for another user succeeded on "demo_Mixed Case"';
   exception when insufficient_privilege then null;
   end;
   perform pg_temp.act_as('authenticated', v_b::text);
-  select count(*) into v_n from public."Demo Table";
-  if v_n <> 0 then raise exception 'FAIL h4: other user sees % rows in "Demo Table"', v_n; end if;
+  select count(*) into v_n from public."demo_Mixed Case";
+  if v_n <> 0 then raise exception 'FAIL h4: other user sees % rows in "demo_Mixed Case"', v_n; end if;
   reset role;
   raise notice 'PASS h4: quoted mixed-case names and a name containing SQL work; owner policies enforce on "Owner""Col"';
 end;

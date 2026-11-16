@@ -215,7 +215,7 @@ A failing check stops with `ERROR:  FAIL <check>: <reason>`, and every later sta
 
 Verification performed on an isolated Supabase project with disposable credentials. Results reproducible with the included test script.
 
-Screenshots of an install and a self-check run are in [`proofs/`](proofs/).
+Screenshots of an install and a self-check run are in [`proofs/`](proofs/). In that run check h12 is skipped, because the role used may not set `session_replication_role` there. The replica-mode check passed on a separate database where the role may set it.
 
 ## Limits and security notes
 

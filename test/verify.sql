@@ -5,7 +5,7 @@
 -- or paste the whole file into the SQL editor.
 --
 -- Everything runs in one transaction that ends in ROLLBACK, so nothing is left behind.
--- It creates tables named public.demo_* and two throwaway rows in auth.users with random ids.
+-- It creates tables and domains named public.demo_* and two throwaway rows in auth.users with random ids.
 -- Any trigger you have on auth.users runs for those two rows (and is rolled back with them).
 --
 -- Each check raises NOTICE 'PASS: ...' or stops with ERROR 'FAIL: ...'. Check h10
@@ -762,6 +762,95 @@ begin
     raise exception 'FAIL i4: foreign key column author_id did not win over plain user_id';
   end if;
   raise notice 'PASS i4: foreign key column (author_id) and plain uuid user_id -> policies on author_id';
+end;
+$$;
+
+-- i5. A user_id with a foreign key to another table is not the owner, even when
+-- owner_id is a plain uuid next to it.
+create table public.demo_members (id uuid primary key default gen_random_uuid());
+create table public.demo_fk_other (
+  id      uuid primary key default gen_random_uuid(),
+  user_id uuid references public.demo_members (id)
+);
+create table public.demo_fk_other_both (
+  id       uuid primary key default gen_random_uuid(),
+  user_id  uuid references public.demo_members (id),
+  owner_id uuid
+);
+
+do $$
+begin
+  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_fk_other'::regclass)
+     or pg_temp.policy_list('public.demo_fk_other') <> ''
+     or not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_fk_other_both'::regclass)
+     or pg_temp.policy_list('public.demo_fk_other_both') <> '' then
+    raise exception 'FAIL i5: user_id with a foreign key to another table should give RLS on and no policies (got % / %)',
+      pg_temp.policy_list('public.demo_fk_other'), pg_temp.policy_list('public.demo_fk_other_both');
+  end if;
+  raise notice 'PASS i5: uuid user_id with a foreign key to public.demo_members -> RLS on, 0 policies (also with a plain owner_id beside it)';
+end;
+$$;
+
+-- i6. Domain over uuid (two levels deep) with a foreign key to auth.users is the owner.
+create domain public.demo_uid as uuid;
+create domain public.demo_uid_deep as public.demo_uid;
+create table public.demo_domain_fk (
+  id        uuid primary key default gen_random_uuid(),
+  author_id public.demo_uid_deep references auth.users (id)
+);
+grant select, insert, update, delete on public.demo_domain_fk to authenticated;
+
+do $$
+declare
+  v_a uuid := current_setting('verify.user_a')::uuid;
+  v_b uuid := current_setting('verify.user_b')::uuid;
+  v_n bigint;
+begin
+  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_domain_fk'::regclass)
+     or pg_temp.policy_list('public.demo_domain_fk') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
+     or exists (select 1 from pg_catalog.pg_policy p
+                 where p.polrelid = 'public.demo_domain_fk'::regclass
+                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid))
+                       not like '%auth.uid()%= (author_id)::uuid)') then
+    raise exception 'FAIL i6: domain over uuid with a foreign key to auth.users did not get 4 policies on author_id (got %)',
+      pg_temp.policy_list('public.demo_domain_fk');
+  end if;
+
+  perform pg_temp.act_as('authenticated', v_a::text);
+  insert into public.demo_domain_fk (author_id) values (v_a);
+  select count(*) into v_n from public.demo_domain_fk;
+  if v_n <> 1 then raise exception 'FAIL i6: owner sees % rows, expected 1', v_n; end if;
+  begin
+    insert into public.demo_domain_fk (author_id) values (v_b);
+    raise exception 'FAIL i6: owner inserted a row for another user';
+  exception when insufficient_privilege then null;
+  end;
+  perform pg_temp.act_as('authenticated', v_b::text);
+  select count(*) into v_n from public.demo_domain_fk;
+  if v_n <> 0 then raise exception 'FAIL i6: other user sees % rows', v_n; end if;
+  reset role;
+  raise notice 'PASS i6: domain over a domain over uuid, foreign key to auth.users -> RLS and 4 policies on author_id; owner only, other user denied';
+end;
+$$;
+
+-- i7. Domain over uuid named user_id, no foreign key: name fallback applies.
+create table public.demo_domain_name (
+  id      uuid primary key default gen_random_uuid(),
+  user_id public.demo_uid
+);
+
+do $$
+begin
+  if not (select relrowsecurity from pg_catalog.pg_class where oid = 'public.demo_domain_name'::regclass)
+     or pg_temp.policy_list('public.demo_domain_name') <> 'a:owner_insert,d:owner_delete,r:owner_select,w:owner_update'
+     or exists (select 1 from pg_catalog.pg_policy p
+                 where p.polrelid = 'public.demo_domain_name'::regclass
+                   and coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid))
+                       not like '%auth.uid()%= (user_id)::uuid)') then
+    raise exception 'FAIL i7: domain over uuid named user_id without a foreign key did not get 4 policies on user_id (got %)',
+      pg_temp.policy_list('public.demo_domain_name');
+  end if;
+  raise notice 'PASS i7: domain over uuid named user_id without a foreign key -> RLS and 4 policies on user_id';
 end;
 $$;
 

@@ -10,7 +10,11 @@
 --   With more than one such column, user_id is used, then owner_id; otherwise no
 --   policies are created. Only when no such foreign key column exists, a uuid
 --   column named exactly user_id, else exactly owner_id, is taken as the owner by
---   its name alone. Foreign key columns always win over the name fallback. A table
+--   its name alone, and only if that column has no foreign key at all. If it has a
+--   foreign key to another table, it is not the owner: no policies are created and
+--   a notice says so. Foreign key columns always win over the name fallback. A
+--   uuid column may also be a domain over uuid. If auth.users does not exist, no
+--   policies are created and a notice says so. A table
 --   without policies is deny-all for anon and authenticated. Existing policies with these names are kept as they are.
 --   Grants are not changed. Re-running this file is safe.
 --   A table created by an extension script (CREATE EXTENSION or ALTER EXTENSION
@@ -28,6 +32,10 @@
 -- Known limits
 --   - A foreign key added later with ALTER TABLE does not fire the trigger. Run
 --     select maintenance.apply_owner_policies('public.your_table');
+--   - A user_id or owner_id column whose foreign key to another table is added
+--     after CREATE TABLE (as a schema restore does) already got the four name
+--     fallback policies, and neither the new foreign key nor the call above
+--     removes them; drop them yourself.
 --   - Tables that existed before this migration are not changed. Same call.
 --   - ALTER TABLE ... SET SCHEMA public does not fire the trigger, so a table moved
 --     into public keeps RLS off. Run the same call on it, or enable RLS and add
@@ -66,8 +74,10 @@ as $$
 declare
   v_users regclass := pg_catalog.to_regclass('auth.users');
   v_kind  "char";
+  v_uuid  name[];
   v_cols  name[];
   v_owner name;
+  v_refs  text;
   v_pred  text;
 begin
   select c.relkind into v_kind from pg_catalog.pg_class c where c.oid = p_table;
@@ -78,39 +88,61 @@ begin
 
   execute pg_catalog.format('alter table %s enable row level security', p_table);
 
-  if v_users is not null then
-    select pg_catalog.array_agg(distinct a.attname order by a.attname) into v_cols
-      from pg_catalog.pg_constraint k
-      join pg_catalog.pg_attribute a on a.attrelid = k.conrelid and a.attnum = k.conkey[1]
-      join pg_catalog.pg_attribute r on r.attrelid = k.confrelid and r.attnum = k.confkey[1]
-     where k.conrelid = p_table
-       and k.contype = 'f'
-       and k.confrelid = v_users
-       and pg_catalog.cardinality(k.conkey) = 1
-       and r.attname = 'id'
-       and a.atttypid = 'pg_catalog.uuid'::pg_catalog.regtype
-       and not a.attisdropped;
+  if v_users is null then
+    raise notice 'rls_autogen: auth.users does not exist, so % cannot have an owner column; RLS is on, no policies created. Add policies yourself.', p_table;
+    return;
   end if;
+
+  -- Columns of type uuid, directly or through a domain over uuid (any depth).
+  with recursive t(attname, typid) as (
+    select a.attname, a.atttypid
+      from pg_catalog.pg_attribute a
+     where a.attrelid = p_table
+       and a.attnum > 0
+       and not a.attisdropped
+    union all
+    select t.attname, y.typbasetype
+      from t
+      join pg_catalog.pg_type y on y.oid = t.typid
+     where y.typtype = 'd'
+  )
+  select pg_catalog.array_agg(t.attname) into v_uuid
+    from t
+   where t.typid = 'pg_catalog.uuid'::pg_catalog.regtype;
+
+  select pg_catalog.array_agg(distinct a.attname order by a.attname) into v_cols
+    from pg_catalog.pg_constraint k
+    join pg_catalog.pg_attribute a on a.attrelid = k.conrelid and a.attnum = k.conkey[1]
+    join pg_catalog.pg_attribute r on r.attrelid = k.confrelid and r.attnum = k.confkey[1]
+   where k.conrelid = p_table
+     and k.contype = 'f'
+     and k.confrelid = v_users
+     and pg_catalog.cardinality(k.conkey) = 1
+     and r.attname = 'id'
+     and a.attname = any (v_uuid)
+     and not a.attisdropped;
 
   if v_cols is null then
     -- Name fallback, used only when no foreign key candidate exists:
-    -- a uuid column named exactly user_id, else exactly owner_id.
-    if v_users is not null then
-      select a.attname into v_owner
-        from pg_catalog.pg_attribute a
-       where a.attrelid = p_table
-         and a.attnum > 0
-         and not a.attisdropped
-         and a.attname in ('user_id', 'owner_id')
-         and a.atttypid = 'pg_catalog.uuid'::pg_catalog.regtype
-       order by a.attname = 'user_id' desc
-       limit 1;
-    end if;
+    -- a uuid column named exactly user_id, else exactly owner_id, and only
+    -- when that column has no foreign key at all.
+    v_owner := case when 'user_id' = any (v_uuid) then 'user_id'
+                    when 'owner_id' = any (v_uuid) then 'owner_id' end;
     if v_owner is null then
-      raise notice 'rls_autogen: % has no owner column (uuid foreign key to auth.users.id, or uuid column user_id or owner_id); RLS is on, no policies created', p_table;
+      raise notice 'rls_autogen: % has no owner column (uuid foreign key to auth.users.id, or uuid column user_id or owner_id without a foreign key); RLS is on, no policies created', p_table;
       return;
     end if;
-    raise notice 'rls_autogen: % has no foreign key to auth.users; using uuid column % as owner by its name', p_table, v_owner;
+    select pg_catalog.string_agg(distinct k.confrelid::pg_catalog.regclass::text, ', ') into v_refs
+      from pg_catalog.pg_constraint k
+      join pg_catalog.pg_attribute a on a.attrelid = k.conrelid and a.attnum = any (k.conkey)
+     where k.conrelid = p_table
+       and k.contype = 'f'
+       and a.attname = v_owner;
+    if v_refs is not null then
+      raise notice 'rls_autogen: % column % references % (not as a single-column key to auth.users.id), so it is not the owner column; RLS is on, no policies created. Add policies yourself.', p_table, v_owner, v_refs;
+      return;
+    end if;
+    raise notice 'rls_autogen: % has no foreign key to auth.users; using uuid column % (no foreign key) as owner by its name', p_table, v_owner;
   elsif pg_catalog.cardinality(v_cols) = 1 then
     v_owner := v_cols[1];
   elsif 'user_id' = any (v_cols) then

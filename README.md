@@ -4,11 +4,11 @@ One Postgres migration that turns on row level security for every new table in a
 
 ## Problem
 
-On Supabase, the default privileges in `public` give `anon` and `authenticated` full access to every new table, and `public` is exposed through the Data API. Row level security is off until someone runs `alter table ... enable row level security` and writes policies. That step is easy to forget, and nothing in Postgres warns you.
+Supabase requires explicit grants to expose new tables through the Data API by default. Once you grant `anon` or `authenticated` access to a table in an exposed schema such as `public`, row level security (RLS) limits which rows those roles can access. When creating a table through SQL, enable RLS and add the policies your application needs. This migration automates that step for supported table creation commands in `public`. See the [Supabase Data API changelog](https://supabase.com/changelog/45329-breaking-change-tables-not-exposed-to-data-and-graphql-api-automatically).
 
 ## Why it matters
 
-A table without RLS in an exposed schema can be read and written by anyone holding the public anon key, which ships in every client. One forgotten table is enough to leak or lose data. Making RLS the default turns that mistake into a table that returns no rows, which shows up in testing instead of in production.
+On a table without RLS, API roles can exercise their table grants across all rows. Enabling RLS as soon as a table is created limits access to the rows its policies allow. With no applicable policy, access is denied.
 
 ## Install
 
@@ -69,7 +69,19 @@ Existing tables, or a table that got its owner foreign key later through `alter 
 select maintenance.apply_owner_policies('public.posts');
 ```
 
-Run it as the table owner. It is idempotent.
+Run it as the table owner. The helper preserves existing policies by name. If it previously generated policies from a fallback `user_id` or `owner_id` and the new foreign key identifies a different owner column, those policies still use the old column. Review the existing policies first. In one transaction, remove the generated policies that need to change and call the helper to recreate them. If all four policies were generated for the old owner column, use:
+
+```sql
+begin;
+drop policy owner_select on public.posts;
+drop policy owner_insert on public.posts;
+drop policy owner_update on public.posts;
+drop policy owner_delete on public.posts;
+select maintenance.apply_owner_policies('public.posts');
+commit;
+```
+
+Review any custom policies separately. If the table has multiple candidate foreign keys, the owner selection rules above still apply.
 
 To watch more schemas than `public`, add them to the `c_schemas` array at the top of `maintenance.rls_autogen()`.
 
